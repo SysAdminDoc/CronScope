@@ -9,6 +9,8 @@
 
 > Full-year cron expression simulator with calendar heatmap visualization, multi-schedule conflict detection, and detailed execution analytics — 100% client-side, zero install.
 
+https://sysadmindoc.github.io/CronScope/
+
 ## Why CronScope?
 
 Every cron tool out there shows you the next 5 runs in a plain text list. That's useless when you're managing production schedules, debugging job overlaps, or trying to understand execution density across an entire year. CronScope gives you the full operational picture at a glance.
