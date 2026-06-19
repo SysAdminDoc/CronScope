@@ -1,6 +1,6 @@
 # CronScope
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![Version](https://img.shields.io/badge/version-0.2.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Any%20Browser-orange)
 ![JavaScript](https://img.shields.io/badge/JavaScript-React%2018-61DAFB?logo=react&logoColor=white)
@@ -43,7 +43,13 @@ cd CronScope
 | Plain English Translation | Converts cron syntax to human-readable descriptions inline |
 | Presets Library | 12 common scheduling patterns — one click to apply to any expression |
 | Year Navigation | Browse any year's schedule with arrow navigation |
-| Dark Theme | Deep dark palette — no light mode, no eye strain |
+| Dark/Light Theme | Toggle between dark and light themes, persisted to localStorage |
+| Named Values & Aliases | Supports `MON-FRI`, `JAN-DEC`, `@daily`, `@hourly`, etc. |
+| Shareable Permalinks | URL encodes current expressions/year for sharing |
+| Schedule Sets | Save/load expression collections to localStorage |
+| Crontab Import | Paste a raw crontab file, each line becomes an expression |
+| Export Report | Copy a full Markdown analysis report to clipboard |
+| Copy as Markdown | One-click copy of plain-English translations |
 | Zero Config | No build step, no dependencies, no server — one HTML file |
 
 ## Usage
@@ -128,7 +134,6 @@ All computation happens client-side in the browser. No data leaves your machine.
 
 **Doesn't:**
 - Support non-standard 6-field (seconds) or 7-field (years) cron
-- Support named months/days (`JAN`, `MON`) — use numbers
 - Execute or schedule actual jobs
 - Send any data anywhere — fully client-side
 
@@ -138,7 +143,7 @@ All computation happens client-side in the browser. No data leaves your machine.
 A: Make sure your cron expression is valid — the input border turns red on invalid syntax. Check the "Plain English" sidebar to verify the expression matches your intent.
 
 **Q: Can I use named days/months like `MON` or `JAN`?**
-A: Not yet. Use numeric values: `1-5` for Mon–Fri, `1-12` for Jan–Dec.
+A: Yes. Use `MON-FRI` for weekdays, `JAN-DEC` for months, and aliases like `@daily`, `@hourly`, `@weekly`, `@monthly`, `@yearly`.
 
 **Q: The "Next 15 Runs" panel is empty**
 A: This panel shows upcoming runs from the current date/time forward. If all your expressions are set to past dates or the current year has no remaining runs, it'll be empty.

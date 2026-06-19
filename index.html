@@ -5,30 +5,40 @@
     <meta name="theme-color" content="#1e1e2e">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CronScope v0.1.0</title>
+<title>CronScope v0.2.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Outfit:wght@700;800&display=swap" rel="stylesheet">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body, #root { min-height: 100vh; background: #0a0e17; }
-  ::-webkit-scrollbar { width: 6px; height: 6px; }
-  ::-webkit-scrollbar-track { background: #0a0e17; }
-  ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: #334155; }
-  input { outline: none; }
-  input::placeholder { color: #475569; }
+  html, body, #root { min-height: 100vh; }
+  body.theme-dark, body.theme-dark #root { background: #0a0e17; color: #e2e8f0; }
+  body.theme-light, body.theme-light #root { background: #f8fafc; color: #1e293b; }
+  body.theme-dark ::-webkit-scrollbar { width: 6px; height: 6px; }
+  body.theme-dark ::-webkit-scrollbar-track { background: #0a0e17; }
+  body.theme-dark ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+  body.theme-dark ::-webkit-scrollbar-thumb:hover { background: #334155; }
+  body.theme-light ::-webkit-scrollbar { width: 6px; height: 6px; }
+  body.theme-light ::-webkit-scrollbar-track { background: #f8fafc; }
+  body.theme-light ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+  body.theme-light ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+  input, textarea { outline: none; }
+  input::placeholder, textarea::placeholder { color: #475569; }
   @keyframes slideIn { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: translateY(0); } }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+  }
 </style>
 </head>
-<body>
+<body class="theme-dark">
 <div id="root"></div>
 <script type="text/babel">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+const MONTHS_FULL = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const DAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 const FIELD_NAMES = ["Minute","Hour","Day of Month","Month","Day of Week"];
 const PRESETS = [
@@ -46,17 +56,51 @@ const PRESETS = [
   { label: "Yearly Jan 1 midnight", expr: "0 0 1 1 *" },
 ];
 
-const C = {
-  bg: "#0a0e17", surface: "#111827", surfaceAlt: "#151d2e",
-  border: "#1e293b", borderHover: "#334155",
-  text: "#e2e8f0", textDim: "#64748b", textMuted: "#475569",
-  accent: "#06b6d4", accentDim: "#0e7490", accentGlow: "rgba(6,182,212,0.15)",
-  error: "#f43f5e", errorDim: "rgba(244,63,94,0.15)",
-  green: "#10b981", orange: "#f59e0b", purple: "#a78bfa",
+// Named value maps for cron month and day-of-week fields
+const MONTH_NAMES = {JAN:1,FEB:2,MAR:3,APR:4,MAY:5,JUN:6,JUL:7,AUG:8,SEP:9,OCT:10,NOV:11,DEC:12};
+const DOW_NAMES = {SUN:0,MON:1,TUE:2,WED:3,THU:4,FRI:5,SAT:6};
+
+// Cron aliases
+const CRON_ALIASES = {
+  "@yearly": "0 0 1 1 *", "@annually": "0 0 1 1 *",
+  "@monthly": "0 0 1 * *", "@weekly": "0 0 * * 0",
+  "@daily": "0 0 * * *", "@midnight": "0 0 * * *",
+  "@hourly": "0 * * * *",
+};
+
+// Theme definitions
+const THEMES = {
+  dark: {
+    bg: "#0a0e17", surface: "#111827", surfaceAlt: "#151d2e",
+    border: "#1e293b", borderHover: "#334155",
+    text: "#e2e8f0", textDim: "#64748b", textMuted: "#475569",
+    accent: "#06b6d4", accentDim: "#0e7490", accentGlow: "rgba(6,182,212,0.15)",
+    error: "#f43f5e", errorDim: "rgba(244,63,94,0.15)",
+    green: "#10b981", orange: "#f59e0b", purple: "#a78bfa",
+    modalOverlay: "rgba(0,0,0,0.6)",
+  },
+  light: {
+    bg: "#f8fafc", surface: "#ffffff", surfaceAlt: "#f1f5f9",
+    border: "#e2e8f0", borderHover: "#cbd5e1",
+    text: "#1e293b", textDim: "#64748b", textMuted: "#94a3b8",
+    accent: "#0891b2", accentDim: "#06b6d4", accentGlow: "rgba(8,145,178,0.1)",
+    error: "#e11d48", errorDim: "rgba(225,29,72,0.1)",
+    green: "#059669", orange: "#d97706", purple: "#7c3aed",
+    modalOverlay: "rgba(0,0,0,0.3)",
+  },
 };
 const EC = ["#06b6d4","#f59e0b","#a78bfa","#f43f5e","#10b981","#fb923c"];
 
-function parseCronField(field, min, max) {
+// Replace named month/day tokens with numeric equivalents
+function resolveNamedValues(field, nameMap) {
+  return field.replace(/[A-Za-z]+/g, token => {
+    const up = token.toUpperCase();
+    return nameMap[up] !== undefined ? String(nameMap[up]) : token;
+  });
+}
+
+function parseCronField(field, min, max, nameMap) {
+  if (nameMap) field = resolveNamedValues(field, nameMap);
   const values = new Set();
   for (const part of field.split(",")) {
     if (part === "*") { for (let i = min; i <= max; i++) values.add(i); }
@@ -86,13 +130,21 @@ function parseCronField(field, min, max) {
 }
 
 function parseCron(expr) {
-  const parts = expr.trim().split(/\s+/);
+  const raw = expr.trim();
+  // Handle aliases
+  if (raw.startsWith("@")) {
+    const alias = CRON_ALIASES[raw.toLowerCase()];
+    if (alias) return parseCron(alias);
+    if (raw.toLowerCase() === "@reboot") return null; // cannot visualize
+    return null;
+  }
+  const parts = raw.split(/\s+/);
   if (parts.length !== 5) return null;
   const minutes = parseCronField(parts[0], 0, 59);
   const hours = parseCronField(parts[1], 0, 23);
   const doms = parseCronField(parts[2], 1, 31);
-  const months = parseCronField(parts[3], 1, 12);
-  let dows = parseCronField(parts[4], 0, 7);
+  const months = parseCronField(parts[3], 1, 12, MONTH_NAMES);
+  let dows = parseCronField(parts[4], 0, 7, DOW_NAMES);
   if (!minutes || !hours || !doms || !months || !dows) return null;
   if (dows.has(7)) { dows.add(0); dows.delete(7); }
   return { minutes, hours, doms, months, dows, domWild: parts[2] === "*", dowWild: parts[4] === "*" };
@@ -121,9 +173,20 @@ function getFireTimes(parsed, year, maxResults = 5000) {
 }
 
 function describeCron(expr) {
-  const parts = expr.trim().split(/\s+/);
+  const raw = expr.trim();
+  // Handle aliases
+  if (raw.startsWith("@")) {
+    const aliasMap = {"@yearly":"At midnight on January 1st","@annually":"At midnight on January 1st","@monthly":"At midnight on the 1st of every month","@weekly":"At midnight on Sunday","@daily":"At midnight every day","@midnight":"At midnight every day","@hourly":"At the start of every hour","@reboot":"On system reboot (cannot visualize)"};
+    const desc = aliasMap[raw.toLowerCase()];
+    if (desc) return desc;
+    return "Unknown alias: " + raw;
+  }
+  const parts = raw.split(/\s+/);
   if (parts.length !== 5) return "Invalid expression";
-  const [min,hr,dom,mon,dow] = parts;
+  let [min,hr,dom,mon,dow] = parts;
+  // Resolve named values for display
+  mon = resolveNamedValues(mon, MONTH_NAMES);
+  dow = resolveNamedValues(dow, DOW_NAMES);
   const pieces = [];
   if (min==="*"&&hr==="*") pieces.push("Every minute");
   else if (min.startsWith("*/")) pieces.push("Every "+min.slice(2)+" minutes");
@@ -157,20 +220,22 @@ function getDayCounts(fireTimes) {
   return counts;
 }
 
-function HeatCell({count,maxCount,color,isToday,tooltip,onClick}) {
+function HeatCell({count,maxCount,color,isToday,tooltip,onClick,accentColor}) {
   const intensity = count===0?0:Math.max(0.15,Math.min(1,count/Math.max(maxCount,1)));
   const bg = count===0?"transparent":color+Math.round(intensity*200).toString(16).padStart(2,"0");
-  const border = isToday?"1px solid "+C.accent:count>0?"1px solid "+color+"22":"1px solid transparent";
+  const border = isToday?"1px solid "+(accentColor||"#06b6d4"):count>0?"1px solid "+color+"22":"1px solid transparent";
   const ref = useRef(null);
   return React.createElement("div",{
-    ref, onClick, title:tooltip,
+    ref, onClick, title:tooltip, role:"gridcell", "aria-label":tooltip,
     style:{width:13,height:13,backgroundColor:bg,border,borderRadius:2,cursor:count>0?"pointer":"default",transition:"all 0.15s",position:"relative"},
     onMouseEnter:()=>{if(count>0&&ref.current){ref.current.style.transform="scale(1.4)";ref.current.style.zIndex="10";}},
     onMouseLeave:()=>{if(ref.current){ref.current.style.transform="scale(1)";ref.current.style.zIndex="1";}},
+    tabIndex:count>0?0:-1,
+    onKeyDown:ev=>{if(count>0&&(ev.key==="Enter"||ev.key===" ")){ev.preventDefault();onClick&&onClick();}},
   });
 }
 
-function CalendarHeatmap({expressions,year,onDayClick}) {
+function CalendarHeatmap({expressions,year,onDayClick,C}) {
   const today = new Date();
   const isCurrentYear = today.getFullYear()===year;
   const allData = useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>({
@@ -178,14 +243,14 @@ function CalendarHeatmap({expressions,year,onDayClick}) {
   })),[expressions,year]);
   const mergedMax = useMemo(()=>{let m=0;for(const d of allData)for(const v of Object.values(d.counts))if(v>m)m=v;return m;},[allData]);
 
-  return React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+  return React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:6},role:"grid","aria-label":"Execution heatmap for "+year},
     MONTHS.map((mName,mIdx)=>{
       const dim=new Date(year,mIdx+1,0).getDate();
       const firstDow=new Date(year,mIdx,1).getDay();
       const weeks=[];let week=new Array(firstDow).fill(null);
       for(let d=1;d<=dim;d++){week.push(d);if(week.length===7){weeks.push(week);week=[];}}
       if(week.length>0){while(week.length<7)week.push(null);weeks.push(week);}
-      return React.createElement("div",{key:mIdx,style:{display:"flex",alignItems:"flex-start",gap:8}},
+      return React.createElement("div",{key:mIdx,style:{display:"flex",alignItems:"flex-start",gap:8},role:"row"},
         React.createElement("div",{style:{width:32,fontSize:11,color:C.textDim,fontFamily:"'JetBrains Mono',monospace",paddingTop:2,textAlign:"right",flexShrink:0}},mName),
         React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:1}},
           weeks.map((w,wi)=>React.createElement("div",{key:wi,style:{display:"flex",gap:1}},
@@ -196,7 +261,7 @@ function CalendarHeatmap({expressions,year,onDayClick}) {
               const totalCount=allData.reduce((s,d)=>s+(d.counts[key]||0),0);
               const domIdx=allData.reduce((best,d,i)=>{const c=d.counts[key]||0;return c>(best.count||0)?{idx:i,count:c}:best;},{idx:0,count:0}).idx;
               const color=allData.length>0?allData[domIdx].color:C.accent;
-              return React.createElement(HeatCell,{key:di,count:totalCount,maxCount:mergedMax,color,isToday:isTodayCell,
+              return React.createElement(HeatCell,{key:di,count:totalCount,maxCount:mergedMax,color,isToday:isTodayCell,accentColor:C.accent,
                 tooltip:mName+" "+day+": "+totalCount+" execution"+(totalCount!==1?"s":""),
                 onClick:()=>totalCount>0&&onDayClick&&onDayClick(year,mIdx,day)});
             })
@@ -207,7 +272,7 @@ function CalendarHeatmap({expressions,year,onDayClick}) {
   );
 }
 
-function DayDetail({year,month,day,expressions,onClose}) {
+function DayDetail({year,month,day,expressions,onClose,C}) {
   const date=new Date(year,month,day);
   const dayName=DAYS[date.getDay()];
   const details=expressions.filter(e=>e.parsed).map((e,i)=>{
@@ -235,7 +300,7 @@ function DayDetail({year,month,day,expressions,onClose}) {
   );
 }
 
-function StatsPanel({expressions,year}) {
+function StatsPanel({expressions,year,C}) {
   const stats=useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
     const times=getFireTimes(e.parsed,year);
     const dayCounts=getDayCounts(times);
@@ -266,7 +331,7 @@ function StatsPanel({expressions,year}) {
   );
 }
 
-function HourlyDist({expressions,year}) {
+function HourlyDist({expressions,year,C}) {
   const data=useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
     const times=getFireTimes(e.parsed,year,5000);const hours=new Array(24).fill(0);
     for(const t of times) hours[t.getHours()]++;
@@ -295,7 +360,7 @@ function HourlyDist({expressions,year}) {
   );
 }
 
-function ConflictDetector({expressions,year}) {
+function ConflictDetector({expressions,year,C}) {
   const conflicts=useMemo(()=>{
     const valid=expressions.filter(e=>e.parsed);if(valid.length<2) return [];
     const hits=[];
@@ -327,15 +392,174 @@ function ConflictDetector({expressions,year}) {
   );
 }
 
-function App() {
-  const [expressions,setExpressions]=useState([{id:1,value:"0 9 * * 1-5",label:"Weekday morning",parsed:null}]);
-  const [year,setYear]=useState(new Date().getFullYear());
-  const [dayDetail,setDayDetail]=useState(null);
-  const [showPresets,setShowPresets]=useState(false);
-  const [activePresetTarget,setActivePresetTarget]=useState(null);
-  const nextId=useRef(2);
+// --- URL state helpers ---
+function encodeURLState(expressions, year) {
+  const params = new URLSearchParams();
+  expressions.forEach((e, i) => {
+    if (e.value.trim()) {
+      params.set("expr" + (i > 0 ? i : ""), e.value);
+      if (e.label.trim()) params.set("label" + (i > 0 ? i : ""), e.label);
+    }
+  });
+  params.set("year", String(year));
+  return params.toString();
+}
 
-  useEffect(()=>{setExpressions(prev=>prev.map(e=>({...e,parsed:parseCron(e.value)})));},[]);
+function decodeURLState() {
+  const params = new URLSearchParams(window.location.search);
+  const exprs = [];
+  // Check expr, expr1, expr2, ... up to 20
+  for (let i = 0; i < 20; i++) {
+    const key = i === 0 ? "expr" : "expr" + i;
+    const val = params.get(key);
+    if (val !== null) {
+      const labelKey = i === 0 ? "label" : "label" + i;
+      exprs.push({ value: val, label: params.get(labelKey) || "" });
+    }
+  }
+  const year = params.has("year") ? parseInt(params.get("year"), 10) : null;
+  return { exprs: exprs.length > 0 ? exprs : null, year: year && !isNaN(year) ? year : null };
+}
+
+// --- localStorage schedule sets ---
+function loadScheduleSets() {
+  try { return JSON.parse(localStorage.getItem("cronscope_sets") || "[]"); } catch { return []; }
+}
+function saveScheduleSets(sets) {
+  try { localStorage.setItem("cronscope_sets", JSON.stringify(sets)); } catch {}
+}
+
+// --- Theme persistence ---
+function loadTheme() {
+  try { return localStorage.getItem("cronscope_theme") || "dark"; } catch { return "dark"; }
+}
+function saveTheme(t) {
+  try { localStorage.setItem("cronscope_theme", t); } catch {}
+}
+
+// --- Crontab import parser ---
+function parseCrontabLines(text) {
+  return text.split("\n")
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith("#"))
+    .map(line => {
+      // Handle aliases
+      if (line.startsWith("@")) {
+        const parts = line.split(/\s+/);
+        const alias = parts[0];
+        const cmd = parts.slice(1).join(" ");
+        return { value: alias, label: cmd ? cmd.split("/").pop().split(" ")[0] : alias };
+      }
+      const parts = line.split(/\s+/);
+      if (parts.length >= 5) {
+        const expr = parts.slice(0, 5).join(" ");
+        const cmd = parts.slice(5).join(" ");
+        const label = cmd ? cmd.split("/").pop().split(" ")[0] : "";
+        return { value: expr, label: label || expr };
+      }
+      return null;
+    })
+    .filter(Boolean);
+}
+
+// --- Markdown report generator ---
+function generateMarkdownReport(expressions, year) {
+  const lines = [];
+  lines.push("# CronScope Schedule Report");
+  lines.push("");
+  lines.push("**Year:** " + year);
+  lines.push("**Generated:** " + new Date().toISOString().slice(0, 10));
+  lines.push("");
+  const valid = expressions.filter(e => e.parsed);
+  if (valid.length === 0) { lines.push("No valid expressions."); return lines.join("\n"); }
+  lines.push("## Expressions");
+  lines.push("");
+  lines.push("| # | Label | Expression | Description |");
+  lines.push("|---|-------|------------|-------------|");
+  valid.forEach((e, i) => {
+    lines.push("| " + (i + 1) + " | " + (e.label || "-") + " | `" + e.value + "` | " + describeCron(e.value) + " |");
+  });
+  lines.push("");
+  lines.push("## Statistics");
+  lines.push("");
+  lines.push("| Label | Runs/Year | Active Days | Max/Day | Avg/Active Day | Peak Hour | Peak Day |");
+  lines.push("|-------|-----------|-------------|---------|----------------|-----------|----------|");
+  valid.forEach((e, i) => {
+    const times = getFireTimes(e.parsed, year);
+    const dayCounts = getDayCounts(times);
+    const activeDays = Object.keys(dayCounts).length;
+    const maxPerDay = Math.max(0, ...Object.values(dayCounts));
+    const hourDist = new Array(24).fill(0); const dowDist = new Array(7).fill(0);
+    for (const t of times) { hourDist[t.getHours()]++; dowDist[t.getDay()]++; }
+    const peakHour = hourDist.indexOf(Math.max(...hourDist));
+    const peakDow = dowDist.indexOf(Math.max(...dowDist));
+    const avg = activeDays > 0 ? (times.length / activeDays).toFixed(1) : "0";
+    lines.push("| " + (e.label || e.value) + " | " + times.length.toLocaleString() + " | " + activeDays + " | " + maxPerDay + " | " + avg + " | " + String(peakHour).padStart(2, "0") + ":00 | " + DAYS[peakDow] + " |");
+  });
+  // Conflicts
+  if (valid.length >= 2) {
+    const conflicts = [];
+    for (let i = 0; i < valid.length; i++) {
+      for (let j = i + 1; j < valid.length; j++) {
+        const setA = new Set(getFireTimes(valid[i].parsed, year, 2000).map(t => t.getTime()));
+        const timesB = getFireTimes(valid[j].parsed, year, 2000);
+        let overlap = 0; for (const t of timesB) if (setA.has(t.getTime())) overlap++;
+        if (overlap > 0) conflicts.push({ a: valid[i].label || valid[i].value, b: valid[j].label || valid[j].value, overlap });
+      }
+    }
+    if (conflicts.length > 0) {
+      lines.push("");
+      lines.push("## Conflicts");
+      lines.push("");
+      conflicts.forEach(c => {
+        lines.push("- **" + c.a + "** overlaps with **" + c.b + "** -- " + c.overlap.toLocaleString() + " shared execution(s)");
+      });
+    }
+  }
+  lines.push("");
+  lines.push("---");
+  lines.push("*Generated by [CronScope](https://sysadmindoc.github.io/CronScope/)*");
+  return lines.join("\n");
+}
+
+function App() {
+  // Load initial state from URL or defaults
+  const urlState = useMemo(() => decodeURLState(), []);
+  const initialExprs = urlState.exprs
+    ? urlState.exprs.map((e, i) => ({ id: i + 1, value: e.value, label: e.label, parsed: parseCron(e.value) }))
+    : [{ id: 1, value: "0 9 * * 1-5", label: "Weekday morning", parsed: parseCron("0 9 * * 1-5") }];
+  const initialYear = urlState.year || new Date().getFullYear();
+
+  const [expressions, setExpressions] = useState(initialExprs);
+  const [year, setYear] = useState(initialYear);
+  const [dayDetail, setDayDetail] = useState(null);
+  const [showPresets, setShowPresets] = useState(false);
+  const [activePresetTarget, setActivePresetTarget] = useState(null);
+  const [theme, setTheme] = useState(loadTheme);
+  const [showImport, setShowImport] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [showSets, setShowSets] = useState(false);
+  const [scheduleSets, setScheduleSets] = useState(loadScheduleSets);
+  const [setNameInput, setSetNameInput] = useState("");
+  const [copyFeedback, setCopyFeedback] = useState(null); // {type, msg}
+  const nextId = useRef(initialExprs.length + 1);
+  const C = THEMES[theme];
+
+  // Apply theme class to body
+  useEffect(() => {
+    document.body.className = "theme-" + theme;
+    saveTheme(theme);
+  }, [theme]);
+
+  // Sync URL with current state (debounced)
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      const qs = encodeURLState(expressions, year);
+      const newUrl = window.location.pathname + (qs ? "?" + qs : "");
+      window.history.replaceState(null, "", newUrl);
+    }, 300);
+    return () => clearTimeout(timeout);
+  }, [expressions, year]);
 
   const updateExpr=useCallback((id,value)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,value,parsed:parseCron(value)}:e));},[]);
   const updateLabel=useCallback((id,label)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,label}:e));},[]);
@@ -345,6 +569,73 @@ function App() {
     if(activePresetTarget!==null) setExpressions(prev=>prev.map(e=>e.id===activePresetTarget?{...e,value:preset.expr,label:preset.label,parsed:parseCron(preset.expr)}:e));
     setShowPresets(false);setActivePresetTarget(null);
   },[activePresetTarget]);
+
+  // Import crontab
+  const handleImport = useCallback(() => {
+    const parsed = parseCrontabLines(importText);
+    if (parsed.length === 0) return;
+    setExpressions(prev => {
+      const newExprs = parsed.map((p, i) => ({ id: nextId.current++, value: p.value, label: p.label, parsed: parseCron(p.value) }));
+      return [...prev, ...newExprs];
+    });
+    setShowImport(false);
+    setImportText("");
+  }, [importText]);
+
+  // Save current schedule set
+  const handleSaveSet = useCallback(() => {
+    const name = setNameInput.trim();
+    if (!name) return;
+    const set = { name, exprs: expressions.map(e => ({ value: e.value, label: e.label })), savedAt: new Date().toISOString() };
+    const updated = [...scheduleSets, set];
+    setScheduleSets(updated);
+    saveScheduleSets(updated);
+    setSetNameInput("");
+  }, [setNameInput, expressions, scheduleSets]);
+
+  // Load a schedule set
+  const handleLoadSet = useCallback((set) => {
+    nextId.current = 1;
+    const loaded = set.exprs.map((e, i) => ({ id: nextId.current++, value: e.value, label: e.label, parsed: parseCron(e.value) }));
+    setExpressions(loaded);
+    setShowSets(false);
+  }, []);
+
+  // Delete a schedule set
+  const handleDeleteSet = useCallback((idx) => {
+    const updated = scheduleSets.filter((_, i) => i !== idx);
+    setScheduleSets(updated);
+    saveScheduleSets(updated);
+  }, [scheduleSets]);
+
+  // Copy as markdown (plain-English translations)
+  const handleCopyMarkdown = useCallback(() => {
+    const lines = expressions.filter(e => e.parsed).map(e => "- **" + (e.label || e.value) + "**: " + describeCron(e.value));
+    if (lines.length === 0) return;
+    navigator.clipboard.writeText(lines.join("\n")).then(() => {
+      setCopyFeedback({ type: "copy", msg: "Copied!" });
+      setTimeout(() => setCopyFeedback(null), 2000);
+    });
+  }, [expressions]);
+
+  // Export full markdown report
+  const handleExportReport = useCallback(() => {
+    const report = generateMarkdownReport(expressions, year);
+    navigator.clipboard.writeText(report).then(() => {
+      setCopyFeedback({ type: "export", msg: "Report copied!" });
+      setTimeout(() => setCopyFeedback(null), 2000);
+    });
+  }, [expressions, year]);
+
+  // Share permalink
+  const handleShareLink = useCallback(() => {
+    const qs = encodeURLState(expressions, year);
+    const url = window.location.origin + window.location.pathname + (qs ? "?" + qs : "");
+    navigator.clipboard.writeText(url).then(() => {
+      setCopyFeedback({ type: "share", msg: "Link copied!" });
+      setTimeout(() => setCopyFeedback(null), 2000);
+    });
+  }, [expressions, year]);
 
   const nextRuns=useMemo(()=>{
     const now=new Date();const allRuns=[];
@@ -364,10 +655,32 @@ function App() {
     React.createElement("div",{style:{maxWidth:1200,margin:"0 auto",padding:"24px 20px"}},
 
       // Header
-      React.createElement("div",{style:{marginBottom:28,display:"flex",alignItems:"baseline",gap:12,flexWrap:"wrap"}},
+      React.createElement("div",{style:{marginBottom:28,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}},
         React.createElement("h1",{style:{fontFamily:"'Outfit',sans-serif",fontSize:28,fontWeight:800,background:"linear-gradient(135deg,"+C.accent+","+C.purple+")",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",letterSpacing:"-0.02em"}},"CronScope"),
-        React.createElement("span",{style:{fontSize:11,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace"}},"v0.1.0"),
-        React.createElement("span",{style:{fontSize:12,color:C.textDim,marginLeft:"auto"}},"Cron Expression Simulator + Calendar Visualizer")
+        React.createElement("span",{style:{fontSize:11,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace"}},"v0.2.0"),
+        React.createElement("span",{style:{fontSize:12,color:C.textDim,marginLeft:"auto",marginRight:8}},"Cron Expression Simulator + Calendar Visualizer"),
+
+        // Theme toggle button
+        React.createElement("button",{onClick:()=>setTheme(t=>t==="dark"?"light":"dark"),title:theme==="dark"?"Switch to light theme":"Switch to dark theme",
+          "aria-label":theme==="dark"?"Switch to light theme":"Switch to dark theme",
+          style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"6px 10px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s",display:"flex",alignItems:"center",gap:4},
+          onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;ev.currentTarget.style.color=C.accent;},
+          onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;ev.currentTarget.style.color=C.textDim;}},
+          theme==="dark"
+            ?React.createElement("svg",{width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2},React.createElement("circle",{cx:12,cy:12,r:5}),React.createElement("path",{d:"M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"}))
+            :React.createElement("svg",{width:16,height:16,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2},React.createElement("path",{d:"M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"}))
+        ),
+
+        // Share permalink button
+        React.createElement("button",{onClick:handleShareLink,title:"Copy shareable link","aria-label":"Copy shareable link",
+          style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"6px 10px",cursor:"pointer",color:copyFeedback&&copyFeedback.type==="share"?C.green:C.textDim,fontSize:12,transition:"all 0.15s",display:"flex",alignItems:"center",gap:4,fontFamily:"'JetBrains Mono',monospace"},
+          onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;},onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;}},
+          React.createElement("svg",{width:14,height:14,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2},
+            React.createElement("path",{d:"M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"}),
+            React.createElement("path",{d:"M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"})
+          ),
+          copyFeedback&&copyFeedback.type==="share"?"Copied!":"Share"
+        )
       ),
 
       // Expression inputs
@@ -375,35 +688,47 @@ function App() {
         expressions.map((e,i)=>{
           const isValid=e.value.trim()===""||e.parsed!==null;
           return React.createElement("div",{key:e.id,style:{display:"flex",gap:8,alignItems:"center",animation:"slideIn 0.2s ease"}},
-            React.createElement("span",{style:{width:10,height:10,borderRadius:"50%",background:EC[i%EC.length],flexShrink:0,boxShadow:"0 0 8px "+EC[i%EC.length]+"55"}}),
-            React.createElement("input",{value:e.label,onChange:ev=>updateLabel(e.id,ev.target.value),placeholder:"Label",
+            React.createElement("span",{style:{width:10,height:10,borderRadius:"50%",background:EC[i%EC.length],flexShrink:0,boxShadow:"0 0 8px "+EC[i%EC.length]+"55"},"aria-hidden":"true"}),
+            React.createElement("input",{value:e.label,onChange:ev=>updateLabel(e.id,ev.target.value),placeholder:"Label","aria-label":"Expression label",
               style:{width:140,padding:"8px 10px",background:C.surface,border:"1px solid "+C.border,borderRadius:8,color:C.text,fontSize:12,fontFamily:"'Inter',sans-serif"}}),
             React.createElement("div",{style:{flex:1,position:"relative"}},
-              React.createElement("input",{value:e.value,onChange:ev=>updateExpr(e.id,ev.target.value),placeholder:"* * * * *  (min hr dom mon dow)",spellCheck:false,
+              React.createElement("input",{value:e.value,onChange:ev=>updateExpr(e.id,ev.target.value),placeholder:"* * * * *  (min hr dom mon dow)",spellCheck:false,"aria-label":"Cron expression","aria-invalid":!isValid?"true":undefined,
                 style:{width:"100%",padding:"8px 12px",background:C.surface,border:"1px solid "+(isValid?C.border:C.error),borderRadius:8,color:C.text,fontSize:14,fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",transition:"border-color 0.15s"},
                 onFocus:ev=>{ev.target.style.borderColor=isValid?C.accent:C.error;},onBlur:ev=>{ev.target.style.borderColor=isValid?C.border:C.error;}}),
               e.parsed?React.createElement("div",{style:{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:10,color:C.textMuted,maxWidth:"40%",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",pointerEvents:"none"}},describeCron(e.value)):null
             ),
-            React.createElement("button",{onClick:()=>{setActivePresetTarget(e.id);setShowPresets(true);},title:"Presets",
+            React.createElement("button",{onClick:()=>{setActivePresetTarget(e.id);setShowPresets(true);},title:"Presets","aria-label":"Open presets",
               style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 10px",cursor:"pointer",color:C.textDim,fontSize:12,transition:"all 0.15s"},
               onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;ev.currentTarget.style.color=C.accent;},
               onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;ev.currentTarget.style.color=C.textDim;}},
-              React.createElement("svg",{width:14,height:14,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2},
+              React.createElement("svg",{width:14,height:14,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,"aria-hidden":"true"},
                 React.createElement("rect",{x:3,y:3,width:7,height:7,rx:1}),React.createElement("rect",{x:14,y:3,width:7,height:7,rx:1}),
                 React.createElement("rect",{x:3,y:14,width:7,height:7,rx:1}),React.createElement("rect",{x:14,y:14,width:7,height:7,rx:1})
               )
             ),
-            expressions.length>1?React.createElement("button",{onClick:()=>removeExpr(e.id),
+            expressions.length>1?React.createElement("button",{onClick:()=>removeExpr(e.id),"aria-label":"Remove expression",
               style:{background:"none",border:"none",color:C.textMuted,cursor:"pointer",fontSize:18,padding:"2px 4px",lineHeight:1},
               onMouseEnter:ev=>{ev.currentTarget.style.color=C.error;},onMouseLeave:ev=>{ev.currentTarget.style.color=C.textMuted;}},"\u00d7"):null
           );
         }),
-        hasInvalid?React.createElement("div",{style:{fontSize:11,color:C.error,paddingLeft:22}},"Invalid cron expression. Format: minute hour day-of-month month day-of-week"):null,
+        hasInvalid?React.createElement("div",{style:{fontSize:11,color:C.error,paddingLeft:22},role:"alert"},"Invalid cron expression. Format: minute hour day-of-month month day-of-week (named values like MON-FRI, JAN-DEC and aliases like @daily are supported)"):null,
         React.createElement("div",{style:{display:"flex",gap:8,paddingLeft:22,alignItems:"center",flexWrap:"wrap"}},
           React.createElement("button",{onClick:addExpr,
             style:{background:C.accentGlow,border:"1px solid "+C.accentDim,borderRadius:8,padding:"6px 14px",color:C.accent,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
             onMouseEnter:ev=>{ev.currentTarget.style.background=C.accent+"33";},onMouseLeave:ev=>{ev.currentTarget.style.background=C.accentGlow;}},
             "+ Add Expression"
+          ),
+          React.createElement("button",{onClick:()=>setShowImport(true),
+            style:{background:"transparent",border:"1px solid "+C.border,borderRadius:8,padding:"6px 14px",color:C.textDim,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
+            onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;ev.currentTarget.style.color=C.accent;},
+            onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;ev.currentTarget.style.color=C.textDim;}},
+            "Import Crontab"
+          ),
+          React.createElement("button",{onClick:()=>setShowSets(true),
+            style:{background:"transparent",border:"1px solid "+C.border,borderRadius:8,padding:"6px 14px",color:C.textDim,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
+            onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;ev.currentTarget.style.color=C.accent;},
+            onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;ev.currentTarget.style.color=C.textDim;}},
+            "Schedule Sets"
           ),
           React.createElement("div",{style:{fontSize:11,color:C.textMuted,display:"flex",alignItems:"center",gap:4}},
             FIELD_NAMES.map((f,i)=>React.createElement("span",{key:i,style:{background:C.surface,padding:"2px 6px",borderRadius:4,fontFamily:"'JetBrains Mono',monospace"}},f))
@@ -412,9 +737,9 @@ function App() {
       ),
 
       // Presets modal
-      showPresets?React.createElement("div",{style:{position:"fixed",inset:0,background:"rgba(0,0,0,0.6)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
-        onClick:()=>{setShowPresets(false);setActivePresetTarget(null);}},
-        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:380,animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
+      showPresets?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
+        onClick:()=>{setShowPresets(false);setActivePresetTarget(null);},role:"dialog","aria-label":"Presets"},
+        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:380,maxHeight:"80vh",overflowY:"auto",animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
           React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:14}},"Presets"),
           React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:4}},
             PRESETS.map((p,i)=>React.createElement("button",{key:i,onClick:()=>applyPreset(p),
@@ -428,12 +753,61 @@ function App() {
         )
       ):null,
 
+      // Import crontab modal
+      showImport?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
+        onClick:()=>{setShowImport(false);setImportText("");},role:"dialog","aria-label":"Import crontab"},
+        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:520,animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
+          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}},"Import Crontab"),
+          React.createElement("div",{style:{fontSize:11,color:C.textDim,marginBottom:12}},"Paste a crontab file below. Lines starting with # are ignored. Each valid line becomes an expression."),
+          React.createElement("textarea",{value:importText,onChange:ev=>setImportText(ev.target.value),placeholder:"# Example crontab\n*/5 * * * * /usr/bin/check-health\n0 9 * * MON-FRI /usr/bin/daily-report\n@daily /usr/bin/cleanup",
+            style:{width:"100%",height:160,padding:12,background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,color:C.text,fontSize:12,fontFamily:"'JetBrains Mono',monospace",resize:"vertical"},
+            "aria-label":"Crontab content"
+          }),
+          React.createElement("div",{style:{display:"flex",gap:8,marginTop:12,justifyContent:"flex-end"}},
+            React.createElement("button",{onClick:()=>{setShowImport(false);setImportText("");},
+              style:{background:"transparent",border:"1px solid "+C.border,borderRadius:8,padding:"6px 14px",color:C.textDim,fontSize:12,cursor:"pointer"}},"Cancel"),
+            React.createElement("button",{onClick:handleImport,
+              style:{background:C.accentGlow,border:"1px solid "+C.accentDim,borderRadius:8,padding:"6px 14px",color:C.accent,fontSize:12,cursor:"pointer",fontWeight:500}},"Import")
+          )
+        )
+      ):null,
+
+      // Schedule sets modal
+      showSets?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
+        onClick:()=>setShowSets(false),role:"dialog","aria-label":"Schedule sets"},
+        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:440,maxHeight:"80vh",overflowY:"auto",animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
+          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:14}},"Schedule Sets"),
+          // Save current
+          React.createElement("div",{style:{display:"flex",gap:8,marginBottom:16}},
+            React.createElement("input",{value:setNameInput,onChange:ev=>setSetNameInput(ev.target.value),placeholder:"Name for current set","aria-label":"Schedule set name",
+              style:{flex:1,padding:"8px 10px",background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,color:C.text,fontSize:12}}),
+            React.createElement("button",{onClick:handleSaveSet,
+              style:{background:C.accentGlow,border:"1px solid "+C.accentDim,borderRadius:8,padding:"6px 14px",color:C.accent,fontSize:12,cursor:"pointer",fontWeight:500,whiteSpace:"nowrap"}},"Save Current")
+          ),
+          // Saved sets
+          scheduleSets.length===0?React.createElement("div",{style:{fontSize:12,color:C.textMuted,textAlign:"center",padding:20}},"No saved schedule sets yet."):
+          React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+            scheduleSets.map((s,i)=>React.createElement("div",{key:i,style:{display:"flex",alignItems:"center",gap:8,padding:"8px 12px",background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8}},
+              React.createElement("div",{style:{flex:1}},
+                React.createElement("div",{style:{fontSize:12,fontWeight:500,color:C.text}},s.name),
+                React.createElement("div",{style:{fontSize:10,color:C.textMuted}},s.exprs.length+" expression"+(s.exprs.length!==1?"s":"")+(s.savedAt?" -- saved "+new Date(s.savedAt).toLocaleDateString():""))
+              ),
+              React.createElement("button",{onClick:()=>handleLoadSet(s),
+                style:{background:"transparent",border:"1px solid "+C.accentDim,borderRadius:6,padding:"4px 10px",color:C.accent,fontSize:11,cursor:"pointer"}},"Load"),
+              React.createElement("button",{onClick:()=>handleDeleteSet(i),
+                style:{background:"none",border:"none",color:C.textMuted,cursor:"pointer",fontSize:16,lineHeight:1},
+                onMouseEnter:ev=>{ev.currentTarget.style.color=C.error;},onMouseLeave:ev=>{ev.currentTarget.style.color=C.textMuted;}},"\u00d7")
+            ))
+          )
+        )
+      ):null,
+
       // Year selector
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:12,marginBottom:16}},
-        React.createElement("button",{onClick:()=>setYear(y=>y-1),style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"4px 12px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s"},
+        React.createElement("button",{onClick:()=>setYear(y=>y-1),"aria-label":"Previous year",style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"4px 12px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s"},
           onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;},onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;}},"\u2190"),
         React.createElement("span",{style:{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:C.text}},year),
-        React.createElement("button",{onClick:()=>setYear(y=>y+1),style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"4px 12px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s"},
+        React.createElement("button",{onClick:()=>setYear(y=>y+1),"aria-label":"Next year",style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"4px 12px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s"},
           onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;},onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;}},"\u2192"),
         React.createElement("button",{onClick:()=>setYear(new Date().getFullYear()),style:{background:"none",border:"none",color:C.accent,fontSize:11,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},"today")
       ),
@@ -451,25 +825,32 @@ function App() {
               React.createElement("div",{style:{width:40}}),
               DAYS.map(d=>React.createElement("div",{key:d,style:{fontSize:8,color:C.textMuted,width:13,textAlign:"center",fontFamily:"'JetBrains Mono',monospace"}},d[0]))
             ),
-            React.createElement(CalendarHeatmap,{expressions,year,onDayClick:(y,m,d)=>setDayDetail({year:y,month:m,day:d})}),
+            React.createElement(CalendarHeatmap,{expressions,year,onDayClick:(y,m,d)=>setDayDetail({year:y,month:m,day:d}),C}),
             React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:12,paddingLeft:40}},
               React.createElement("span",{style:{fontSize:9,color:C.textMuted}},"Less"),
               [0.1,0.3,0.5,0.7,1].map((opacity,i)=>React.createElement("div",{key:i,style:{width:10,height:10,borderRadius:2,backgroundColor:C.accent+Math.round(opacity*200).toString(16).padStart(2,"0")}})),
               React.createElement("span",{style:{fontSize:9,color:C.textMuted}},"More")
             )
           ),
-          dayDetail?React.createElement(DayDetail,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,onClose:()=>setDayDetail(null)}):null,
-          React.createElement("div",{style:{marginTop:16}},React.createElement(HourlyDist,{expressions,year})),
-          React.createElement(ConflictDetector,{expressions,year})
+          dayDetail?React.createElement(DayDetail,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,onClose:()=>setDayDetail(null),C}):null,
+          React.createElement("div",{style:{marginTop:16}},React.createElement(HourlyDist,{expressions,year,C})),
+          React.createElement(ConflictDetector,{expressions,year,C})
         ),
 
         // Right sidebar
         React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:16}},
-          // Plain English
+          // Plain English + copy button
           expressions.filter(e=>e.parsed).length>0?React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:14}},
-            React.createElement("div",{style:{fontSize:11,fontWeight:600,color:C.textDim,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}},"Plain English"),
+            React.createElement("div",{style:{fontSize:11,fontWeight:600,color:C.textDim,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em",display:"flex",alignItems:"center",justifyContent:"space-between"}},
+              React.createElement("span",null,"Plain English"),
+              React.createElement("button",{onClick:handleCopyMarkdown,title:"Copy as Markdown","aria-label":"Copy as Markdown",
+                style:{background:"none",border:"none",color:copyFeedback&&copyFeedback.type==="copy"?C.green:C.textMuted,cursor:"pointer",fontSize:10,fontFamily:"'JetBrains Mono',monospace",transition:"color 0.15s"},
+                onMouseEnter:ev=>{if(!copyFeedback)ev.currentTarget.style.color=C.accent;},onMouseLeave:ev=>{if(!copyFeedback)ev.currentTarget.style.color=C.textMuted;}},
+                copyFeedback&&copyFeedback.type==="copy"?"Copied!":"Copy MD"
+              )
+            ),
             expressions.filter(e=>e.parsed).map((e,i)=>React.createElement("div",{key:e.id,style:{fontSize:12,color:C.text,marginBottom:6,display:"flex",alignItems:"flex-start",gap:6,lineHeight:1.5}},
-              React.createElement("span",{style:{width:6,height:6,borderRadius:"50%",background:EC[i%EC.length],flexShrink:0,marginTop:5}}),
+              React.createElement("span",{style:{width:6,height:6,borderRadius:"50%",background:EC[i%EC.length],flexShrink:0,marginTop:5},"aria-hidden":"true"}),
               describeCron(e.value)
             ))
           ):null,
@@ -479,7 +860,7 @@ function App() {
             React.createElement("div",{style:{fontSize:11,fontWeight:600,color:C.textDim,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}},"Next 15 Runs"),
             React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:3}},
               nextRuns.map((r,i)=>React.createElement("div",{key:i,style:{fontSize:11,display:"flex",alignItems:"center",gap:6,padding:"3px 0",fontFamily:"'JetBrains Mono',monospace",color:C.textDim}},
-                React.createElement("span",{style:{width:5,height:5,borderRadius:"50%",background:r.color,flexShrink:0}}),
+                React.createElement("span",{style:{width:5,height:5,borderRadius:"50%",background:r.color,flexShrink:0},"aria-hidden":"true"}),
                 React.createElement("span",{style:{color:C.text}},MONTHS[r.time.getMonth()]+" "+r.time.getDate()),
                 React.createElement("span",null,String(r.time.getHours()).padStart(2,"0")+":"+String(r.time.getMinutes()).padStart(2,"0")),
                 React.createElement("span",{style:{fontSize:9,color:C.textMuted,marginLeft:"auto"}},DAYS[r.time.getDay()])
@@ -488,7 +869,22 @@ function App() {
           ):null,
 
           // Stats
-          React.createElement(StatsPanel,{expressions,year})
+          React.createElement(StatsPanel,{expressions,year,C}),
+
+          // Export report button
+          React.createElement("button",{onClick:handleExportReport,
+            style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:"10px 14px",color:copyFeedback&&copyFeedback.type==="export"?C.green:C.textDim,fontSize:12,cursor:"pointer",transition:"all 0.15s",display:"flex",alignItems:"center",justifyContent:"center",gap:6,fontFamily:"'JetBrains Mono',monospace"},
+            onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;ev.currentTarget.style.color=C.accent;},
+            onMouseLeave:ev=>{if(!copyFeedback||copyFeedback.type!=="export"){ev.currentTarget.style.borderColor=C.border;ev.currentTarget.style.color=C.textDim;}}},
+            React.createElement("svg",{width:14,height:14,viewBox:"0 0 24 24",fill:"none",stroke:"currentColor",strokeWidth:2,"aria-hidden":"true"},
+              React.createElement("path",{d:"M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"}),
+              React.createElement("polyline",{points:"14 2 14 8 20 8"}),
+              React.createElement("line",{x1:16,y1:13,x2:8,y2:13}),
+              React.createElement("line",{x1:16,y1:17,x2:8,y2:17}),
+              React.createElement("polyline",{points:"10 9 9 9 8 9"})
+            ),
+            copyFeedback&&copyFeedback.type==="export"?"Report Copied!":"Export Markdown Report"
+          )
         )
       )
     )
