@@ -477,6 +477,93 @@ function ConflictDetector({expressions,year,C}) {
   );
 }
 
+// Diff mode: compare two expressions, show overlap vs exclusive cells
+function DiffView({exprA, exprB, idxA, idxB, year, C}) {
+  const data = useMemo(() => {
+    if (!exprA.parsed || !exprB.parsed) return null;
+    const timesA = getFireTimes(exprA.parsed, year, 5000);
+    const timesB = getFireTimes(exprB.parsed, year, 5000);
+    const countsA = getDayCounts(timesA);
+    const countsB = getDayCounts(timesB);
+    const allKeys = new Set([...Object.keys(countsA), ...Object.keys(countsB)]);
+    const overlap = {}; const onlyA = {}; const onlyB = {};
+    for (const k of allKeys) {
+      const a = countsA[k] || 0, b = countsB[k] || 0;
+      if (a > 0 && b > 0) overlap[k] = Math.min(a, b);
+      else if (a > 0) onlyA[k] = a;
+      else onlyB[k] = b;
+    }
+    return { overlap, onlyA, onlyB, totalOverlap: Object.keys(overlap).length, totalOnlyA: Object.keys(onlyA).length, totalOnlyB: Object.keys(onlyB).length };
+  }, [exprA, exprB, year]);
+  if (!data) return null;
+  const colorA = EC[idxA % EC.length], colorB = EC[idxB % EC.length];
+  const maxCount = Math.max(1, ...Object.values(data.overlap), ...Object.values(data.onlyA), ...Object.values(data.onlyB));
+
+  return React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:18,marginTop:16}},
+    React.createElement("div",{style:{fontSize:12,fontWeight:600,color:C.textDim,marginBottom:12}},"DIFF VIEW"),
+    React.createElement("div",{style:{display:"flex",gap:16,marginBottom:12,fontSize:11}},
+      React.createElement("span",{style:{display:"flex",alignItems:"center",gap:4}},React.createElement("span",{style:{width:10,height:10,borderRadius:2,background:colorA}}),(exprA.label||exprA.value)+" only: "+data.totalOnlyA+" days"),
+      React.createElement("span",{style:{display:"flex",alignItems:"center",gap:4}},React.createElement("span",{style:{width:10,height:10,borderRadius:2,background:colorB}}),(exprB.label||exprB.value)+" only: "+data.totalOnlyB+" days"),
+      React.createElement("span",{style:{display:"flex",alignItems:"center",gap:4}},React.createElement("span",{style:{width:10,height:10,borderRadius:2,background:C.orange}}),"Overlap: "+data.totalOverlap+" days")
+    ),
+    React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:6}},
+      MONTHS.map((mName,mIdx)=>{
+        const dim=new Date(year,mIdx+1,0).getDate();
+        const firstDow=new Date(year,mIdx,1).getDay();
+        const weeks=[];let week=new Array(firstDow).fill(null);
+        for(let d=1;d<=dim;d++){week.push(d);if(week.length===7){weeks.push(week);week=[];}}
+        if(week.length>0){while(week.length<7)week.push(null);weeks.push(week);}
+        return React.createElement("div",{key:mIdx,style:{display:"flex",alignItems:"flex-start",gap:8}},
+          React.createElement("div",{style:{width:32,fontSize:11,color:C.textDim,fontFamily:"'JetBrains Mono',monospace",paddingTop:2,textAlign:"right",flexShrink:0}},mName),
+          React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:1}},
+            weeks.map((w,wi)=>React.createElement("div",{key:wi,style:{display:"flex",gap:1}},
+              w.map((day,di)=>{
+                if(day===null) return React.createElement("div",{key:di,style:{width:13,height:13}});
+                const key=mIdx+"-"+day;
+                let bg="transparent",color=C.border;
+                if(data.overlap[key]){bg=C.orange+"aa";color=C.orange;}
+                else if(data.onlyA[key]){bg=colorA+"77";color=colorA;}
+                else if(data.onlyB[key]){bg=colorB+"77";color=colorB;}
+                return React.createElement("div",{key:di,title:mName+" "+day+(data.overlap[key]?" (overlap)":data.onlyA[key]?" ("+(exprA.label||"A")+" only)":data.onlyB[key]?" ("+(exprB.label||"B")+" only)":""),
+                  style:{width:13,height:13,backgroundColor:bg,border:"1px solid "+color+"22",borderRadius:2}});
+              })
+            ))
+          )
+        );
+      })
+    )
+  );
+}
+
+// Gantt-style 24h timeline strip for a selected day
+function GanttStrip({year,month,day,expressions,C}) {
+  const strips = useMemo(() => expressions.filter(e=>e.parsed).map((e,i) => {
+    const times = getFireTimes(e.parsed, year, 5000).filter(t => t.getMonth() === month && t.getDate() === day);
+    const minutes = times.map(t => t.getHours() * 60 + t.getMinutes());
+    return { label: e.label || e.value, color: EC[i % EC.length], minutes, count: times.length };
+  }).filter(s => s.count > 0), [expressions, year, month, day]);
+  if (strips.length === 0) return null;
+  const totalMin = 24 * 60;
+
+  return React.createElement("div",{style:{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:10,padding:14,marginTop:8}},
+    React.createElement("div",{style:{fontSize:11,fontWeight:600,color:C.textDim,marginBottom:8}},"24H TIMELINE"),
+    strips.map((s,i) => React.createElement("div",{key:i,style:{marginBottom:8}},
+      React.createElement("div",{style:{fontSize:10,color:s.color,fontFamily:"'JetBrains Mono',monospace",marginBottom:3,display:"flex",alignItems:"center",gap:4}},
+        React.createElement("span",{style:{width:6,height:6,borderRadius:"50%",background:s.color}}),
+        s.label+" ("+s.count+" run"+(s.count!==1?"s":"")+")"
+      ),
+      React.createElement("div",{style:{position:"relative",height:12,background:C.border+"44",borderRadius:3,overflow:"hidden"}},
+        s.minutes.map((m,j) => React.createElement("div",{key:j,title:String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0"),
+          style:{position:"absolute",left:(m/totalMin*100)+"%",width:Math.max(1,100/totalMin*2)+"%",height:"100%",backgroundColor:s.color,opacity:0.8}}))
+      )
+    )),
+    // Hour markers
+    React.createElement("div",{style:{display:"flex",justifyContent:"space-between",marginTop:4}},
+      [0,3,6,9,12,15,18,21].map(h=>React.createElement("span",{key:h,style:{fontSize:8,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace"}},String(h).padStart(2,"0")))
+    )
+  );
+}
+
 // --- URL state helpers ---
 function encodeURLState(expressions, year) {
   const params = new URLSearchParams();
@@ -627,6 +714,9 @@ function App() {
   const [scheduleSets, setScheduleSets] = useState(loadScheduleSets);
   const [setNameInput, setSetNameInput] = useState("");
   const [copyFeedback, setCopyFeedback] = useState(null); // {type, msg}
+  const [diffMode, setDiffMode] = useState(false);
+  const [diffA, setDiffA] = useState(0);
+  const [diffB, setDiffB] = useState(1);
   const nextId = useRef(initialExprs.length + 1);
   const C = THEMES[theme];
 
@@ -905,7 +995,25 @@ function App() {
         React.createElement("span",{style:{fontSize:18,fontWeight:700,fontFamily:"'JetBrains Mono',monospace",color:C.text}},year),
         React.createElement("button",{onClick:()=>setYear(y=>y+1),"aria-label":"Next year",style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"4px 12px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s"},
           onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;},onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;}},"\u2192"),
-        React.createElement("button",{onClick:()=>setYear(new Date().getFullYear()),style:{background:"none",border:"none",color:C.accent,fontSize:11,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},"today")
+        React.createElement("button",{onClick:()=>setYear(new Date().getFullYear()),style:{background:"none",border:"none",color:C.accent,fontSize:11,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},"today"),
+        // Diff mode toggle (only when 2+ valid expressions)
+        expressions.filter(e=>e.parsed).length>=2?React.createElement("button",{onClick:()=>setDiffMode(d=>!d),
+          style:{background:diffMode?C.accentGlow:C.surface,border:"1px solid "+(diffMode?C.accent:C.border),borderRadius:8,padding:"4px 12px",cursor:"pointer",color:diffMode?C.accent:C.textDim,fontSize:11,transition:"all 0.15s",fontFamily:"'JetBrains Mono',monospace",marginLeft:8},
+          onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;},onMouseLeave:ev=>{if(!diffMode)ev.currentTarget.style.borderColor=C.border;}},
+          "Diff Mode"
+        ):null,
+        // Diff expression selectors
+        diffMode&&expressions.filter(e=>e.parsed).length>=2?React.createElement("div",{style:{display:"flex",gap:6,alignItems:"center",marginLeft:4}},
+          React.createElement("select",{value:diffA,onChange:ev=>setDiffA(Number(ev.target.value)),"aria-label":"First expression for diff",
+            style:{background:C.surface,border:"1px solid "+C.border,borderRadius:6,padding:"3px 6px",color:C.text,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}},
+            expressions.map((e,i)=>e.parsed?React.createElement("option",{key:i,value:i},e.label||e.value||"Expr "+(i+1)):null)
+          ),
+          React.createElement("span",{style:{color:C.textDim,fontSize:11}},"vs"),
+          React.createElement("select",{value:diffB,onChange:ev=>setDiffB(Number(ev.target.value)),"aria-label":"Second expression for diff",
+            style:{background:C.surface,border:"1px solid "+C.border,borderRadius:6,padding:"3px 6px",color:C.text,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}},
+            expressions.map((e,i)=>e.parsed?React.createElement("option",{key:i,value:i},e.label||e.value||"Expr "+(i+1)):null)
+          )
+        ):null
       ),
 
       // Main grid
@@ -929,6 +1037,9 @@ function App() {
             )
           ),
           dayDetail?React.createElement(DayDetail,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,onClose:()=>setDayDetail(null),C}):null,
+          dayDetail?React.createElement(GanttStrip,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,C}):null,
+          diffMode&&expressions[diffA]&&expressions[diffB]&&expressions[diffA].parsed&&expressions[diffB].parsed&&diffA!==diffB
+            ?React.createElement(DiffView,{exprA:expressions[diffA],exprB:expressions[diffB],idxA:diffA,idxB:diffB,year,C}):null,
           React.createElement("div",{style:{marginTop:16}},React.createElement(HourlyDist,{expressions,year,C})),
           React.createElement(ConflictDetector,{expressions,year,C})
         ),
