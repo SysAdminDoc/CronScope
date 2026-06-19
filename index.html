@@ -150,6 +150,26 @@ function parseCron(expr) {
   return { minutes, hours, doms, months, dows, domWild: parts[2] === "*", dowWild: parts[4] === "*" };
 }
 
+// Estimate total fire count without materializing all dates
+function estimateFireCount(parsed, year) {
+  const { minutes, hours, doms, months, dows, domWild, dowWild } = parsed;
+  let count = 0;
+  for (const month of months) {
+    const dim = new Date(year, month, 0).getDate();
+    for (let day = 1; day <= dim; day++) {
+      if (!doms.has(day)) continue;
+      const date = new Date(year, month-1, day);
+      const dow = date.getDay();
+      if (!domWild && !dowWild) { if (!doms.has(day) && !dows.has(dow)) continue; }
+      else if (!dowWild) { if (!dows.has(dow)) continue; }
+      count += hours.size * minutes.size;
+    }
+  }
+  return count;
+}
+
+const FIRE_COUNT_CAP = 500000;
+
 function getFireTimes(parsed, year, maxResults = 5000) {
   const results = [];
   const { minutes, hours, doms, months, dows, domWild, dowWild } = parsed;
@@ -212,6 +232,62 @@ function describeCron(expr) {
     pieces.push("on "+dNames.join(", "));
   }
   return pieces.join(" ");
+}
+
+// Detailed validation returning per-field errors and suggestions
+function validateCronExpr(expr) {
+  const raw = expr.trim();
+  if (!raw) return { valid: true, fields: [], suggestions: [] };
+  // Aliases
+  if (raw.startsWith("@")) {
+    const lower = raw.toLowerCase();
+    if (CRON_ALIASES[lower]) return { valid: true, fields: [], suggestions: [] };
+    if (lower === "@reboot") return { valid: false, fields: [], suggestions: ["@reboot cannot be visualized -- it runs only at system boot"] };
+    const known = Object.keys(CRON_ALIASES).concat(["@reboot"]);
+    const closest = known.filter(a => a.startsWith(lower.slice(0, 3)));
+    return { valid: false, fields: [], suggestions: closest.length > 0 ? ["Did you mean: " + closest.join(", ") + "?"] : ["Unknown alias. Known aliases: " + known.join(", ")] };
+  }
+  const parts = raw.split(/\s+/);
+  if (parts.length !== 5) {
+    const suggestions = [];
+    if (parts.length < 5) suggestions.push("Too few fields (" + parts.length + "/5). Format: minute hour day-of-month month day-of-week");
+    if (parts.length > 5 && parts.length <= 7) suggestions.push("Got " + parts.length + " fields. CronScope supports standard 5-field cron (6/7-field Quartz mode coming soon)");
+    if (parts.length > 7) suggestions.push("Too many fields (" + parts.length + "/5). Format: minute hour day-of-month month day-of-week");
+    return { valid: false, fields: [], suggestions };
+  }
+  const fieldDefs = [
+    { name: "Minute", min: 0, max: 59, nameMap: null },
+    { name: "Hour", min: 0, max: 23, nameMap: null },
+    { name: "Day of Month", min: 1, max: 31, nameMap: null },
+    { name: "Month", min: 1, max: 12, nameMap: MONTH_NAMES },
+    { name: "Day of Week", min: 0, max: 7, nameMap: DOW_NAMES },
+  ];
+  const fields = [];
+  const suggestions = [];
+  let allValid = true;
+  parts.forEach((part, i) => {
+    const def = fieldDefs[i];
+    const result = parseCronField(part, def.min, def.max, def.nameMap);
+    if (result === null) {
+      allValid = false;
+      fields.push({ index: i, name: def.name, value: part, error: true });
+      // Generate specific suggestions
+      if (def.nameMap) {
+        const resolvedField = resolveNamedValues(part, def.nameMap);
+        if (/[A-Za-z]/.test(resolvedField)) {
+          const validNames = Object.keys(def.nameMap).join(", ");
+          suggestions.push(def.name + ": unrecognized name in '" + part + "'. Valid names: " + validNames);
+        } else {
+          suggestions.push(def.name + ": value out of range (" + def.min + "-" + def.max + ") in '" + part + "'");
+        }
+      } else {
+        suggestions.push(def.name + ": invalid value '" + part + "' (range: " + def.min + "-" + def.max + ")");
+      }
+    } else {
+      fields.push({ index: i, name: def.name, value: part, error: false });
+    }
+  });
+  return { valid: allValid, fields, suggestions };
 }
 
 function getDayCounts(fireTimes) {
@@ -302,15 +378,17 @@ function DayDetail({year,month,day,expressions,onClose,C}) {
 
 function StatsPanel({expressions,year,C}) {
   const stats=useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
-    const times=getFireTimes(e.parsed,year);
+    const estimated = estimateFireCount(e.parsed, year);
+    const capped = estimated > FIRE_COUNT_CAP;
+    const times=getFireTimes(e.parsed,year,capped?5000:undefined);
     const dayCounts=getDayCounts(times);
     const activeDays=Object.keys(dayCounts).length;
     const maxPerDay=Math.max(0,...Object.values(dayCounts));
     const hourDist=new Array(24).fill(0);const dowDist=new Array(7).fill(0);
     for(const t of times){hourDist[t.getHours()]++;dowDist[t.getDay()]++;}
-    return {label:e.label||e.value,color:EC[i%EC.length],total:times.length,activeDays,maxPerDay,
+    return {label:e.label||e.value,color:EC[i%EC.length],total:capped?estimated:times.length,activeDays,maxPerDay,
       peakHour:hourDist.indexOf(Math.max(...hourDist)),peakDow:dowDist.indexOf(Math.max(...dowDist)),
-      avgPerDay:activeDays>0?(times.length/activeDays).toFixed(1):"0"};
+      avgPerDay:activeDays>0?((capped?estimated:times.length)/activeDays).toFixed(1):"0",capped,estimated};
   }),[expressions,year]);
   if(stats.length===0) return null;
 
@@ -319,8 +397,15 @@ function StatsPanel({expressions,year,C}) {
       React.createElement("div",{style:{fontSize:11,color:s.color,fontFamily:"'JetBrains Mono',monospace",marginBottom:10,display:"flex",alignItems:"center",gap:6,borderBottom:"1px solid "+C.border,paddingBottom:8}},
         React.createElement("span",{style:{width:8,height:8,borderRadius:"50%",background:s.color,flexShrink:0}}),s.label
       ),
+      s.capped?React.createElement("div",{style:{fontSize:10,color:C.orange,background:C.orange+"15",padding:"4px 8px",borderRadius:6,marginBottom:8,display:"flex",alignItems:"center",gap:4},role:"alert"},
+        React.createElement("svg",{width:12,height:12,viewBox:"0 0 24 24",fill:"none",stroke:C.orange,strokeWidth:2,"aria-hidden":"true"},
+          React.createElement("path",{d:"M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"}),
+          React.createElement("line",{x1:12,y1:9,x2:12,y2:13}),React.createElement("line",{x1:12,y1:17,x2:12.01,y2:17})
+        ),
+        "Expression fires "+s.estimated.toLocaleString()+"+ times/year -- consider simplifying"
+      ):null,
       React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}},
-        [{l:"Total runs/yr",v:s.total.toLocaleString()},{l:"Active days",v:s.activeDays},{l:"Max/day",v:s.maxPerDay},{l:"Avg/active day",v:s.avgPerDay},{l:"Peak hour",v:String(s.peakHour).padStart(2,"0")+":00"},{l:"Peak day",v:DAYS[s.peakDow]}].map((item,j)=>
+        [{l:"Total runs/yr",v:(s.capped?"~":"")+s.total.toLocaleString()},{l:"Active days",v:s.activeDays},{l:"Max/day",v:s.maxPerDay},{l:"Avg/active day",v:s.avgPerDay},{l:"Peak hour",v:String(s.peakHour).padStart(2,"0")+":00"},{l:"Peak day",v:DAYS[s.peakDow]}].map((item,j)=>
           React.createElement("div",{key:j},
             React.createElement("div",{style:{fontSize:9,color:C.textMuted,textTransform:"uppercase",letterSpacing:"0.05em"}},item.l),
             React.createElement("div",{style:{fontSize:14,color:C.text,fontWeight:600,fontFamily:"'JetBrains Mono',monospace"}},item.v)
@@ -711,7 +796,18 @@ function App() {
               onMouseEnter:ev=>{ev.currentTarget.style.color=C.error;},onMouseLeave:ev=>{ev.currentTarget.style.color=C.textMuted;}},"\u00d7"):null
           );
         }),
-        hasInvalid?React.createElement("div",{style:{fontSize:11,color:C.error,paddingLeft:22},role:"alert"},"Invalid cron expression. Format: minute hour day-of-month month day-of-week (named values like MON-FRI, JAN-DEC and aliases like @daily are supported)"):null,
+        // Validation panel with per-field errors and suggestions
+        expressions.filter(e=>e.value.trim()!==""&&!e.parsed).map(e=>{
+          const v=validateCronExpr(e.value);
+          return React.createElement("div",{key:"val-"+e.id,style:{fontSize:11,color:C.error,paddingLeft:22,marginBottom:4,background:C.errorDim,borderRadius:8,padding:"8px 12px",border:"1px solid "+C.error+"33"},role:"alert"},
+            React.createElement("div",{style:{fontWeight:600,marginBottom:v.suggestions.length>0?4:0}},(e.label||"Expression")+": Invalid"),
+            v.fields.filter(f=>f.error).map((f,i)=>React.createElement("div",{key:i,style:{display:"flex",gap:6,alignItems:"center",marginBottom:2}},
+              React.createElement("span",{style:{fontFamily:"'JetBrains Mono',monospace",background:C.error+"22",padding:"1px 4px",borderRadius:3}},f.name),
+              React.createElement("span",null,"'"+f.value+"' is invalid")
+            )),
+            v.suggestions.map((s,i)=>React.createElement("div",{key:"s"+i,style:{color:C.orange,marginTop:2}},s))
+          );
+        }),
         React.createElement("div",{style:{display:"flex",gap:8,paddingLeft:22,alignItems:"center",flexWrap:"wrap"}},
           React.createElement("button",{onClick:addExpr,
             style:{background:C.accentGlow,border:"1px solid "+C.accentDim,borderRadius:8,padding:"6px 14px",color:C.accent,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
