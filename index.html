@@ -2,10 +2,12 @@
 <html lang="en">
 <head>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 1 1%22><rect width=%221%22 height=%221%22 fill=%22%23cdd6f4%22/></svg>">
+    <link rel="manifest" href="manifest.webmanifest">
     <meta name="theme-color" content="#1e1e2e">
+<meta name="description" content="Offline cron schedule visualizer with parser dialects, heatmaps, conflict detection, and export tools.">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CronScope v0.2.0</title>
+<title>CronScope v0.3.0</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
@@ -40,7 +42,17 @@ const { useState, useEffect, useMemo, useCallback, useRef } = React;
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 const MONTHS_FULL = ["January","February","March","April","May","June","July","August","September","October","November","December"];
 const DAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-const FIELD_NAMES = ["Minute","Hour","Day of Month","Month","Day of Week"];
+const VERSION = "0.3.0";
+const FIELD_MODE_LABELS = { auto:"Auto", "5":"5 fields", "6":"6 fields + seconds", "7":"7 fields + seconds/year" };
+const DIALECTS = {
+  unix: { label:"Unix", requiresQuestion:false, allowQuestion:false, dowBase:"unix", awsYear:false },
+  quartz: { label:"Quartz", requiresQuestion:true, allowQuestion:true, dowBase:"quartz", awsYear:false },
+  kubernetes: { label:"Kubernetes", requiresQuestion:false, allowQuestion:false, dowBase:"unix", awsYear:false },
+  github: { label:"GitHub Actions", requiresQuestion:false, allowQuestion:false, dowBase:"unix", awsYear:false },
+  aws: { label:"AWS EventBridge", requiresQuestion:true, allowQuestion:true, dowBase:"quartz", awsYear:true },
+};
+const DEFAULT_PARSE_OPTIONS = { dialect:"unix", fieldMode:"auto", timezone:"local", dstAware:false };
+const TIMEZONE_OPTIONS = ["local","UTC","America/New_York","America/Chicago","America/Denver","America/Los_Angeles","Europe/London","Europe/Berlin","Asia/Tokyo","Australia/Sydney"];
 const PRESETS = [
   { label: "Every minute", expr: "* * * * *" },
   { label: "Every 5 minutes", expr: "*/5 * * * *" },
@@ -90,6 +102,9 @@ const THEMES = {
   },
 };
 const EC = ["#06b6d4","#f59e0b","#a78bfa","#f43f5e","#10b981","#fb923c"];
+const LOCAL_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
+const TZ_FORMATTERS = new Map();
+const ZONED_INSTANT_CACHE = new Map();
 
 // Replace named month/day tokens with numeric equivalents
 function resolveNamedValues(field, nameMap) {
@@ -97,6 +112,47 @@ function resolveNamedValues(field, nameMap) {
     const up = token.toUpperCase();
     return nameMap[up] !== undefined ? String(nameMap[up]) : token;
   });
+}
+
+function getParseOptions(options) {
+  const merged = Object.assign({}, DEFAULT_PARSE_OPTIONS, options || {});
+  if (merged.timezone !== "local") {
+    try { new Intl.DateTimeFormat("en-US", { timeZone:merged.timezone }).format(new Date()); }
+    catch { merged.timezone = "local"; }
+  }
+  return merged;
+}
+
+function getDialectConfig(dialect) {
+  return DIALECTS[dialect] || DIALECTS.unix;
+}
+
+function getFieldNames(options) {
+  const opts = getParseOptions(options);
+  const mode = opts.fieldMode;
+  if (mode === "7") return ["Second","Minute","Hour","Day of Month","Month","Day of Week","Year"];
+  if (mode === "6" && getDialectConfig(opts.dialect).awsYear) return ["Minute","Hour","Day of Month","Month","Day of Week","Year"];
+  if (mode === "6") return ["Second","Minute","Hour","Day of Month","Month","Day of Week"];
+  return ["Minute","Hour","Day of Month","Month","Day of Week"];
+}
+
+function expandAliasExpression(raw, options) {
+  const alias = CRON_ALIASES[raw.toLowerCase()];
+  if (!alias) return null;
+  const opts = getParseOptions(options);
+  if (opts.fieldMode === "6") return getDialectConfig(opts.dialect).awsYear ? alias + " *" : "0 " + alias;
+  if (opts.fieldMode === "7") return "0 " + alias + " *";
+  return alias;
+}
+
+function cleanCronExpression(raw, options) {
+  const opts = getParseOptions(options);
+  let text = raw.trim();
+  if (opts.dialect === "aws") {
+    const match = text.match(/^cron\((.*)\)$/i);
+    if (match) text = match[1].trim();
+  }
+  return text;
 }
 
 function parseCronField(field, min, max, nameMap) {
@@ -129,70 +185,392 @@ function parseCronField(field, min, max, nameMap) {
   return values;
 }
 
-function parseCron(expr) {
+function parseDayOfMonthField(field, options) {
+  const opts = getParseOptions(options);
+  const dialect = getDialectConfig(opts.dialect);
+  const result = { values:new Set(), wildcard:false, noSpecific:false, specials:[], raw:field };
+  if (field === "*") {
+    result.wildcard = true;
+    for (let i = 1; i <= 31; i++) result.values.add(i);
+    return result;
+  }
+  if (field === "?") {
+    if (!dialect.allowQuestion) return null;
+    result.noSpecific = true;
+    return result;
+  }
+  for (const part of field.split(",")) {
+    const upper = part.toUpperCase();
+    if (upper === "L") result.specials.push({ type:"lastDay", offset:0 });
+    else if (/^L-\d+$/.test(upper)) result.specials.push({ type:"lastDay", offset:parseInt(upper.slice(2), 10) });
+    else if (upper === "LW") result.specials.push({ type:"lastWeekday" });
+    else if (/^\d+W$/.test(upper)) {
+      const day = parseInt(upper.slice(0, -1), 10);
+      if (day < 1 || day > 31) return null;
+      result.specials.push({ type:"nearestWeekday", day });
+    } else {
+      const parsed = parseCronField(part, 1, 31);
+      if (!parsed) return null;
+      parsed.forEach(v => result.values.add(v));
+    }
+  }
+  return result;
+}
+
+function parseDowNumber(token, options) {
+  const opts = getParseOptions(options);
+  const dialect = getDialectConfig(opts.dialect);
+  const upper = token.toUpperCase();
+  if (DOW_NAMES[upper] !== undefined) return DOW_NAMES[upper];
+  const n = parseInt(token, 10);
+  if (isNaN(n)) return null;
+  if (dialect.dowBase === "quartz") {
+    if (n < 1 || n > 7) return null;
+    return n === 1 ? 0 : n - 1;
+  }
+  if (n === 7) return 0;
+  if (n < 0 || n > 6) return null;
+  return n;
+}
+
+function addDowRange(values, start, end, step) {
+  if (start <= end) {
+    for (let i = start; i <= end; i += step) values.add(i);
+    return;
+  }
+  const wrapped = [];
+  for (let i = start; i <= 6; i++) wrapped.push(i);
+  for (let i = 0; i <= end; i++) wrapped.push(i);
+  wrapped.forEach((v, idx) => { if (idx % step === 0) values.add(v); });
+}
+
+function parseDowSimplePart(part, options) {
+  const values = new Set();
+  const [rangePart, stepPart] = part.split("/");
+  const step = stepPart === undefined ? 1 : parseInt(stepPart, 10);
+  if (isNaN(step) || step <= 0) return null;
+  if (rangePart === "*") {
+    addDowRange(values, 0, 6, step);
+    return values;
+  }
+  if (rangePart.includes("-")) {
+    const [a, b] = rangePart.split("-");
+    const start = parseDowNumber(a, options);
+    const end = parseDowNumber(b, options);
+    if (start === null || end === null) return null;
+    addDowRange(values, start, end, step);
+    return values;
+  }
+  const one = parseDowNumber(rangePart, options);
+  if (one === null) return null;
+  values.add(one);
+  return values;
+}
+
+function parseDayOfWeekField(field, options) {
+  const opts = getParseOptions(options);
+  const dialect = getDialectConfig(opts.dialect);
+  const result = { values:new Set(), wildcard:false, noSpecific:false, specials:[], raw:field };
+  if (field === "*") {
+    result.wildcard = true;
+    for (let i = 0; i <= 6; i++) result.values.add(i);
+    return result;
+  }
+  if (field === "?") {
+    if (!dialect.allowQuestion) return null;
+    result.noSpecific = true;
+    return result;
+  }
+  for (const part of field.split(",")) {
+    const upper = part.toUpperCase();
+    if (/^[A-Z0-9]+L$/.test(upper) && upper.length > 1) {
+      const dow = parseDowNumber(upper.slice(0, -1), options);
+      if (dow === null) return null;
+      result.specials.push({ type:"lastDow", dow });
+    } else if (upper === "L") {
+      result.specials.push({ type:"lastDow", dow:6 });
+    } else if (upper.includes("#")) {
+      const [dowToken, nthToken] = upper.split("#");
+      const dow = parseDowNumber(dowToken, options);
+      const nth = parseInt(nthToken, 10);
+      if (dow === null || isNaN(nth) || nth < 1 || nth > 5) return null;
+      result.specials.push({ type:"nthDow", dow, nth });
+    } else {
+      const parsed = parseDowSimplePart(upper, options);
+      if (!parsed) return null;
+      parsed.forEach(v => result.values.add(v));
+    }
+  }
+  return result;
+}
+
+function determineCronLayout(parts, options) {
+  const opts = getParseOptions(options);
+  const dialect = getDialectConfig(opts.dialect);
+  if (opts.fieldMode !== "auto") {
+    if (parts.length !== Number(opts.fieldMode)) return null;
+    if (opts.fieldMode === "5") return { hasSeconds:false, hasYear:false, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:null };
+    if (opts.fieldMode === "6" && dialect.awsYear) return { hasSeconds:false, hasYear:true, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:5 };
+    if (opts.fieldMode === "6") return { hasSeconds:true, hasYear:false, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:null };
+    return { hasSeconds:true, hasYear:true, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:6 };
+  }
+  if (parts.length === 5) return { hasSeconds:false, hasYear:false, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:null };
+  if (parts.length === 6 && dialect.awsYear) return { hasSeconds:false, hasYear:true, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:5 };
+  if (parts.length === 6) return { hasSeconds:true, hasYear:false, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:null };
+  if (parts.length === 7) return { hasSeconds:true, hasYear:true, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:6 };
+  return null;
+}
+
+function parseCron(expr, options) {
+  const opts = getParseOptions(options);
   const raw = expr.trim();
   // Handle aliases
   if (raw.startsWith("@")) {
-    const alias = CRON_ALIASES[raw.toLowerCase()];
-    if (alias) return parseCron(alias);
+    const alias = expandAliasExpression(raw, opts);
+    if (alias) return parseCron(alias, opts);
     if (raw.toLowerCase() === "@reboot") return null; // cannot visualize
     return null;
   }
-  const parts = raw.split(/\s+/);
-  if (parts.length !== 5) return null;
-  const minutes = parseCronField(parts[0], 0, 59);
-  const hours = parseCronField(parts[1], 0, 23);
-  const doms = parseCronField(parts[2], 1, 31);
-  const months = parseCronField(parts[3], 1, 12, MONTH_NAMES);
-  let dows = parseCronField(parts[4], 0, 7, DOW_NAMES);
-  if (!minutes || !hours || !doms || !months || !dows) return null;
-  if (dows.has(7)) { dows.add(0); dows.delete(7); }
-  return { minutes, hours, doms, months, dows, domWild: parts[2] === "*", dowWild: parts[4] === "*" };
+  const cleaned = cleanCronExpression(raw, opts);
+  const parts = cleaned.split(/\s+/);
+  const layout = determineCronLayout(parts, opts);
+  if (!layout) return null;
+  const seconds = layout.hasSeconds ? parseCronField(parts[layout.second], 0, 59) : new Set([0]);
+  const minutes = parseCronField(parts[layout.minute], 0, 59);
+  const hours = parseCronField(parts[layout.hour], 0, 23);
+  const domField = parseDayOfMonthField(parts[layout.dom], opts);
+  const months = parseCronField(parts[layout.month], 1, 12, MONTH_NAMES);
+  const dowField = parseDayOfWeekField(parts[layout.dow], opts);
+  const years = layout.hasYear ? parseCronField(parts[layout.year], 1970, 2199) : null;
+  if (!seconds || !minutes || !hours || !domField || !months || !dowField || (layout.hasYear && !years)) return null;
+  const dialect = getDialectConfig(opts.dialect);
+  const domRestricted = !domField.wildcard && !domField.noSpecific;
+  const dowRestricted = !dowField.wildcard && !dowField.noSpecific;
+  if (dialect.requiresQuestion && ((domRestricted && dowRestricted) || (domField.noSpecific && dowField.noSpecific))) return null;
+  if (!dialect.allowQuestion && (domField.noSpecific || dowField.noSpecific)) return null;
+  return {
+    seconds, minutes, hours, months, years,
+    doms:domField.values, dows:dowField.values, domField, dowField,
+    domWild:domField.wildcard || domField.noSpecific,
+    dowWild:dowField.wildcard || dowField.noSpecific,
+    hasSeconds:layout.hasSeconds, hasYear:layout.hasYear,
+    fieldCount:parts.length, dialect:opts.dialect, timezone:opts.timezone, dstAware:opts.dstAware,
+    dailyCandidates:seconds.size * minutes.size * hours.size,
+    raw:cleaned,
+  };
+}
+
+function isLastDayOfMonth(year, month, day, offset) {
+  return day === new Date(year, month, 0).getDate() - (offset || 0);
+}
+
+function nearestWeekday(year, month, day) {
+  const dim = new Date(year, month, 0).getDate();
+  const target = Math.min(day, dim);
+  const date = new Date(year, month - 1, target);
+  const dow = date.getDay();
+  if (dow === 6) return target === 1 ? 3 : target - 1;
+  if (dow === 0) return target === dim ? target - 2 : target + 1;
+  return target;
+}
+
+function lastWeekday(year, month) {
+  const dim = new Date(year, month, 0).getDate();
+  for (let day = dim; day >= dim - 6; day--) {
+    const dow = new Date(year, month - 1, day).getDay();
+    if (dow >= 1 && dow <= 5) return day;
+  }
+  return dim;
+}
+
+function lastDowOfMonth(year, month, dow) {
+  const dim = new Date(year, month, 0).getDate();
+  for (let day = dim; day >= 1; day--) if (new Date(year, month - 1, day).getDay() === dow) return day;
+  return null;
+}
+
+function nthDowOfMonth(year, month, dow, nth) {
+  let count = 0;
+  const dim = new Date(year, month, 0).getDate();
+  for (let day = 1; day <= dim; day++) {
+    if (new Date(year, month - 1, day).getDay() === dow) {
+      count++;
+      if (count === nth) return day;
+    }
+  }
+  return null;
+}
+
+function matchesDomField(field, year, month, day) {
+  if (field.wildcard || field.noSpecific) return true;
+  if (field.values.has(day)) return true;
+  return field.specials.some(s => {
+    if (s.type === "lastDay") return isLastDayOfMonth(year, month, day, s.offset);
+    if (s.type === "lastWeekday") return day === lastWeekday(year, month);
+    if (s.type === "nearestWeekday") return day === nearestWeekday(year, month, s.day);
+    return false;
+  });
+}
+
+function matchesDowField(field, year, month, day) {
+  if (field.wildcard || field.noSpecific) return true;
+  const dow = new Date(year, month - 1, day).getDay();
+  if (field.values.has(dow)) return true;
+  return field.specials.some(s => {
+    if (s.type === "lastDow") return day === lastDowOfMonth(year, month, s.dow);
+    if (s.type === "nthDow") return day === nthDowOfMonth(year, month, s.dow, s.nth);
+    return false;
+  });
+}
+
+function matchesScheduleDate(parsed, year, month, day) {
+  const domMatch = matchesDomField(parsed.domField, year, month, day);
+  const dowMatch = matchesDowField(parsed.dowField, year, month, day);
+  if (parsed.domField.noSpecific) return dowMatch;
+  if (parsed.dowField.noSpecific) return domMatch;
+  if (parsed.domField.wildcard && parsed.dowField.wildcard) return true;
+  if (parsed.domField.wildcard) return dowMatch;
+  if (parsed.dowField.wildcard) return domMatch;
+  return getDialectConfig(parsed.dialect).requiresQuestion ? domMatch && dowMatch : domMatch || dowMatch;
+}
+
+function getTZFormatter(timezone) {
+  if (!TZ_FORMATTERS.has(timezone)) {
+    TZ_FORMATTERS.set(timezone, new Intl.DateTimeFormat("en-US", {
+      timeZone:timezone, year:"numeric", month:"2-digit", day:"2-digit",
+      hour:"2-digit", minute:"2-digit", second:"2-digit", hour12:false, hourCycle:"h23"
+    }));
+  }
+  return TZ_FORMATTERS.get(timezone);
+}
+
+function getTZParts(ts, timezone) {
+  const parts = {};
+  getTZFormatter(timezone).formatToParts(new Date(ts)).forEach(p => {
+    if (p.type !== "literal") parts[p.type] = p.value;
+  });
+  return {
+    year:parseInt(parts.year, 10), month:parseInt(parts.month, 10), day:parseInt(parts.day, 10),
+    hour:parseInt(parts.hour, 10) % 24, minute:parseInt(parts.minute, 10), second:parseInt(parts.second, 10)
+  };
+}
+
+function findZonedInstants(year, monthIndex, day, hour, minute, second, timezone) {
+  const key = [timezone, year, monthIndex, day, hour, minute, second].join("|");
+  if (ZONED_INSTANT_CACHE.has(key)) return ZONED_INSTANT_CACHE.get(key);
+  const approx = Date.UTC(year, monthIndex, day, hour, minute, second);
+  const matches = [];
+  for (let ts = approx - 14 * 3600000; ts <= approx + 14 * 3600000; ts += 60000) {
+    const p = getTZParts(ts, timezone);
+    if (p.year === year && p.month === monthIndex + 1 && p.day === day && p.hour === hour && p.minute === minute && p.second === second) matches.push(ts);
+  }
+  ZONED_INSTANT_CACHE.set(key, matches);
+  return matches;
+}
+
+function createDisplayDate(instant, year, monthIndex, day, hour, minute, second, duplicated) {
+  const date = new Date(instant);
+  const dow = new Date(year, monthIndex, day).getDay();
+  date.__cronDisplay = { year, monthIndex, day, hour, minute, second, dow, duplicated:!!duplicated };
+  date.getFullYear = function(){ return this.__cronDisplay.year; };
+  date.getMonth = function(){ return this.__cronDisplay.monthIndex; };
+  date.getDate = function(){ return this.__cronDisplay.day; };
+  date.getHours = function(){ return this.__cronDisplay.hour; };
+  date.getMinutes = function(){ return this.__cronDisplay.minute; };
+  date.getSeconds = function(){ return this.__cronDisplay.second; };
+  date.getDay = function(){ return this.__cronDisplay.dow; };
+  return date;
+}
+
+function makeFireDates(parsed, year, monthIndex, day, hour, minute, second) {
+  const timezone = parsed.timezone || "local";
+  if (timezone === "local" || timezone === LOCAL_TIMEZONE) return [new Date(year, monthIndex, day, hour, minute, second)];
+  if (parsed.dstAware && parsed.dailyCandidates <= 240) {
+    const instants = findZonedInstants(year, monthIndex, day, hour, minute, second, timezone);
+    return instants.map((ts, i) => createDisplayDate(ts, year, monthIndex, day, hour, minute, second, instants.length > 1 && i > 0));
+  }
+  return [createDisplayDate(Date.UTC(year, monthIndex, day, hour, minute, second), year, monthIndex, day, hour, minute, second, false)];
 }
 
 // Estimate total fire count without materializing all dates
 function estimateFireCount(parsed, year) {
-  const { minutes, hours, doms, months, dows, domWild, dowWild } = parsed;
+  if (parsed.years && !parsed.years.has(year)) return 0;
   let count = 0;
-  for (const month of months) {
+  for (const month of parsed.months) {
     const dim = new Date(year, month, 0).getDate();
     for (let day = 1; day <= dim; day++) {
-      if (!doms.has(day)) continue;
-      const date = new Date(year, month-1, day);
-      const dow = date.getDay();
-      if (!domWild && !dowWild) { if (!doms.has(day) && !dows.has(dow)) continue; }
-      else if (!dowWild) { if (!dows.has(dow)) continue; }
-      count += hours.size * minutes.size;
+      if (!matchesScheduleDate(parsed, year, month, day)) continue;
+      count += parsed.hours.size * parsed.minutes.size * parsed.seconds.size;
     }
   }
   return count;
 }
 
 const FIRE_COUNT_CAP = 500000;
+const FIRE_TIME_CACHE = new Map();
+
+function parsedCacheKey(parsed, year, maxResults) {
+  return [parsed.raw, parsed.dialect, parsed.timezone, parsed.dstAware ? "dst" : "wall", year, maxResults].join("|");
+}
 
 function getFireTimes(parsed, year, maxResults = 5000) {
+  const key = parsedCacheKey(parsed, year, maxResults);
+  if (FIRE_TIME_CACHE.has(key)) return FIRE_TIME_CACHE.get(key);
   const results = [];
-  const { minutes, hours, doms, months, dows, domWild, dowWild } = parsed;
-  for (const month of [...months].sort((a,b)=>a-b)) {
+  if (parsed.years && !parsed.years.has(year)) {
+    FIRE_TIME_CACHE.set(key, results);
+    return results;
+  }
+  for (const month of [...parsed.months].sort((a,b)=>a-b)) {
     const dim = new Date(year, month, 0).getDate();
     for (let day = 1; day <= dim; day++) {
-      if (!doms.has(day)) continue;
-      const date = new Date(year, month-1, day);
-      const dow = date.getDay();
-      if (!domWild && !dowWild) { if (!doms.has(day) && !dows.has(dow)) continue; }
-      else if (!dowWild) { if (!dows.has(dow)) continue; }
-      for (const hour of [...hours].sort((a,b)=>a-b)) {
-        for (const minute of [...minutes].sort((a,b)=>a-b)) {
-          results.push(new Date(year, month-1, day, hour, minute));
-          if (results.length >= maxResults) return results;
+      if (!matchesScheduleDate(parsed, year, month, day)) continue;
+      for (const hour of [...parsed.hours].sort((a,b)=>a-b)) {
+        for (const minute of [...parsed.minutes].sort((a,b)=>a-b)) {
+          for (const second of [...parsed.seconds].sort((a,b)=>a-b)) {
+            const dates = makeFireDates(parsed, year, month - 1, day, hour, minute, second);
+            for (const date of dates) {
+              results.push(date);
+              if (results.length >= maxResults) {
+                FIRE_TIME_CACHE.set(key, results);
+                return results;
+              }
+            }
+          }
         }
       }
     }
   }
+  FIRE_TIME_CACHE.set(key, results);
   return results;
 }
 
-function describeCron(expr) {
+function getCronDisplayParts(expr, options) {
+  const opts = getParseOptions(options);
+  const raw = expr.trim();
+  if (raw.startsWith("@")) {
+    const alias = expandAliasExpression(raw, opts);
+    if (!alias) return null;
+    return getCronDisplayParts(alias, opts);
+  }
+  const cleaned = cleanCronExpression(raw, opts);
+  const parts = cleaned.split(/\s+/);
+  const layout = determineCronLayout(parts, opts);
+  if (!layout) return null;
+  return {
+    second:layout.hasSeconds ? parts[layout.second] : "0",
+    minute:parts[layout.minute],
+    hour:parts[layout.hour],
+    dom:parts[layout.dom],
+    month:parts[layout.month],
+    dow:parts[layout.dow],
+    year:layout.hasYear ? parts[layout.year] : "*",
+    hasSeconds:layout.hasSeconds,
+    hasYear:layout.hasYear,
+  };
+}
+
+function describeCron(expr, options) {
   const raw = expr.trim();
   // Handle aliases
   if (raw.startsWith("@")) {
@@ -201,13 +579,18 @@ function describeCron(expr) {
     if (desc) return desc;
     return "Unknown alias: " + raw;
   }
-  const parts = raw.split(/\s+/);
-  if (parts.length !== 5) return "Invalid expression";
-  let [min,hr,dom,mon,dow] = parts;
+  const display = getCronDisplayParts(expr, options);
+  if (!display) return "Invalid expression";
+  let { second:minSecond, minute:min, hour:hr, dom, month:mon, dow, year:yr } = display;
   // Resolve named values for display
   mon = resolveNamedValues(mon, MONTH_NAMES);
-  dow = resolveNamedValues(dow, DOW_NAMES);
+  dow = dow === "?" ? dow : resolveNamedValues(dow, DOW_NAMES);
   const pieces = [];
+  if (display.hasSeconds && minSecond !== "0") {
+    if (minSecond === "*") pieces.push("Every second");
+    else if (minSecond.startsWith("*/")) pieces.push("Every "+minSecond.slice(2)+" seconds");
+    else pieces.push("At second "+minSecond);
+  }
   if (min==="*"&&hr==="*") pieces.push("Every minute");
   else if (min.startsWith("*/")) pieces.push("Every "+min.slice(2)+" minutes");
   else if (hr==="*"&&min!=="*") pieces.push("At minute "+min+" of every hour");
@@ -226,16 +609,22 @@ function describeCron(expr) {
   if (dow!=="*") {
     const dMap={"0":"Sun","1":"Mon","2":"Tue","3":"Wed","4":"Thu","5":"Fri","6":"Sat","7":"Sun"};
     const dNames = dow.split(",").map(d=>{
+      if(d==="?") return "no specific weekday";
+      if(d.includes("#")){const[a,b]=d.split("#");return (dMap[a]||a)+" #"+b;}
+      if(d.endsWith("L")){const base=d.slice(0,-1);return (dMap[base]||base||"Sat")+" last-in-month";}
       if(d.includes("-")){const[a,b]=d.split("-");return (dMap[a]||a)+"-"+(dMap[b]||b);}
       return dMap[d]||d;
     });
     pieces.push("on "+dNames.join(", "));
   }
+  if (display.hasYear && yr !== "*") pieces.push("in "+yr);
   return pieces.join(" ");
 }
 
 // Detailed validation returning per-field errors and suggestions
-function validateCronExpr(expr) {
+function validateCronExpr(expr, options) {
+  const opts = getParseOptions(options);
+  const dialect = getDialectConfig(opts.dialect);
   const raw = expr.trim();
   if (!raw) return { valid: true, fields: [], suggestions: [] };
   // Aliases
@@ -247,30 +636,34 @@ function validateCronExpr(expr) {
     const closest = known.filter(a => a.startsWith(lower.slice(0, 3)));
     return { valid: false, fields: [], suggestions: closest.length > 0 ? ["Did you mean: " + closest.join(", ") + "?"] : ["Unknown alias. Known aliases: " + known.join(", ")] };
   }
-  const parts = raw.split(/\s+/);
-  if (parts.length !== 5) {
+  const cleaned = cleanCronExpression(raw, opts);
+  const parts = cleaned.split(/\s+/);
+  const layout = determineCronLayout(parts, opts);
+  if (!layout) {
     const suggestions = [];
-    if (parts.length < 5) suggestions.push("Too few fields (" + parts.length + "/5). Format: minute hour day-of-month month day-of-week");
-    if (parts.length > 5 && parts.length <= 7) suggestions.push("Got " + parts.length + " fields. CronScope supports standard 5-field cron (6/7-field Quartz mode coming soon)");
-    if (parts.length > 7) suggestions.push("Too many fields (" + parts.length + "/5). Format: minute hour day-of-month month day-of-week");
+    const expected = opts.fieldMode === "auto" ? "5, 6, or 7" : opts.fieldMode;
+    if (parts.length < 5) suggestions.push("Too few fields (" + parts.length + "). Expected " + expected + " fields for " + dialect.label + ".");
+    else suggestions.push("Got " + parts.length + " fields. Expected " + expected + " fields for " + dialect.label + ".");
+    if (opts.dialect === "aws") suggestions.push("AWS accepts cron(min hour day-of-month month day-of-week year); cron(...) wrapper is optional.");
     return { valid: false, fields: [], suggestions };
   }
-  const fieldDefs = [
-    { name: "Minute", min: 0, max: 59, nameMap: null },
-    { name: "Hour", min: 0, max: 23, nameMap: null },
-    { name: "Day of Month", min: 1, max: 31, nameMap: null },
-    { name: "Month", min: 1, max: 12, nameMap: MONTH_NAMES },
-    { name: "Day of Week", min: 0, max: 7, nameMap: DOW_NAMES },
-  ];
+  const fieldDefs = [];
+  if (layout.hasSeconds) fieldDefs.push({ index:layout.second, name:"Second", type:"simple", min:0, max:59, nameMap:null });
+  fieldDefs.push({ index:layout.minute, name:"Minute", type:"simple", min:0, max:59, nameMap:null });
+  fieldDefs.push({ index:layout.hour, name:"Hour", type:"simple", min:0, max:23, nameMap:null });
+  fieldDefs.push({ index:layout.dom, name:"Day of Month", type:"dom", min:1, max:31, nameMap:null });
+  fieldDefs.push({ index:layout.month, name:"Month", type:"simple", min:1, max:12, nameMap:MONTH_NAMES });
+  fieldDefs.push({ index:layout.dow, name:"Day of Week", type:"dow", min:0, max:7, nameMap:DOW_NAMES });
+  if (layout.hasYear) fieldDefs.push({ index:layout.year, name:"Year", type:"simple", min:1970, max:2199, nameMap:null });
   const fields = [];
   const suggestions = [];
   let allValid = true;
-  parts.forEach((part, i) => {
-    const def = fieldDefs[i];
-    const result = parseCronField(part, def.min, def.max, def.nameMap);
+  fieldDefs.forEach((def, i) => {
+    const part = parts[def.index];
+    const result = def.type === "dom" ? parseDayOfMonthField(part, opts) : def.type === "dow" ? parseDayOfWeekField(part, opts) : parseCronField(part, def.min, def.max, def.nameMap);
     if (result === null) {
       allValid = false;
-      fields.push({ index: i, name: def.name, value: part, error: true });
+      fields.push({ index: def.index, name: def.name, value: part, error: true });
       // Generate specific suggestions
       if (def.nameMap) {
         const resolvedField = resolveNamedValues(part, def.nameMap);
@@ -284,9 +677,15 @@ function validateCronExpr(expr) {
         suggestions.push(def.name + ": invalid value '" + part + "' (range: " + def.min + "-" + def.max + ")");
       }
     } else {
-      fields.push({ index: i, name: def.name, value: part, error: false });
+      fields.push({ index: def.index, name: def.name, value: part, error: false });
     }
   });
+  const parsed = allValid ? parseCron(raw, opts) : null;
+  if (allValid && !parsed) {
+    allValid = false;
+    if (dialect.requiresQuestion) suggestions.push(dialect.label + " requires either day-of-month or day-of-week to be '?' when the other is restricted.");
+    else suggestions.push("Expression is not valid for the selected dialect.");
+  }
   return { valid: allValid, fields, suggestions };
 }
 
@@ -296,19 +695,25 @@ function getDayCounts(fireTimes) {
   return counts;
 }
 
-function HeatCell({count,maxCount,color,isToday,tooltip,onClick,accentColor}) {
+function formatRunTime(t) {
+  const base = String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0");
+  const sec = t.getSeconds && t.getSeconds() ? ":"+String(t.getSeconds()).padStart(2,"0") : "";
+  return base + sec + (t.__cronDisplay && t.__cronDisplay.duplicated ? " DST+" : "");
+}
+
+function HeatCell({count,maxCount,color,isToday,tooltip,onClick,accentColor,size=13,label}) {
   const intensity = count===0?0:Math.max(0.15,Math.min(1,count/Math.max(maxCount,1)));
   const bg = count===0?"transparent":color+Math.round(intensity*200).toString(16).padStart(2,"0");
   const border = isToday?"1px solid "+(accentColor||"#06b6d4"):count>0?"1px solid "+color+"22":"1px solid transparent";
   const ref = useRef(null);
   return React.createElement("div",{
     ref, onClick, title:tooltip, role:"gridcell", "aria-label":tooltip,
-    style:{width:13,height:13,backgroundColor:bg,border,borderRadius:2,cursor:count>0?"pointer":"default",transition:"all 0.15s",position:"relative"},
+    style:{width:size,height:size,backgroundColor:bg,border,borderRadius:2,cursor:count>0?"pointer":"default",transition:"all 0.15s",position:"relative",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:count>0?"#fff":"inherit",fontFamily:"'JetBrains Mono',monospace"},
     onMouseEnter:()=>{if(count>0&&ref.current){ref.current.style.transform="scale(1.4)";ref.current.style.zIndex="10";}},
     onMouseLeave:()=>{if(ref.current){ref.current.style.transform="scale(1)";ref.current.style.zIndex="1";}},
     tabIndex:count>0?0:-1,
     onKeyDown:ev=>{if(count>0&&(ev.key==="Enter"||ev.key===" ")){ev.preventDefault();onClick&&onClick();}},
-  });
+  }, label || null);
 }
 
 function CalendarHeatmap({expressions,year,onDayClick,C}) {
@@ -348,6 +753,84 @@ function CalendarHeatmap({expressions,year,onDayClick,C}) {
   );
 }
 
+function buildDayAggregation(expressions, year) {
+  const allData = expressions.filter(e=>e.parsed).map((e,i)=>({
+    counts:getDayCounts(getFireTimes(e.parsed,year)), color:EC[i%EC.length], label:e.label || e.value
+  }));
+  let max = 0;
+  for (const data of allData) for (const v of Object.values(data.counts)) if (v > max) max = v;
+  return { allData, max };
+}
+
+function aggregateDay(aggregation, monthIndex, day, fallbackColor) {
+  const key = monthIndex+"-"+day;
+  let total = 0;
+  let best = { count:0, color:fallbackColor };
+  aggregation.allData.forEach(data => {
+    const count = data.counts[key] || 0;
+    total += count;
+    if (count > best.count) best = { count, color:data.color };
+  });
+  return { total, color:best.color || fallbackColor };
+}
+
+function MonthZoom({expressions,year,month,onDayClick,C}) {
+  const aggregation = useMemo(()=>buildDayAggregation(expressions, year),[expressions,year]);
+  const dim = new Date(year, month + 1, 0).getDate();
+  const firstDow = new Date(year, month, 1).getDay();
+  const cells = [];
+  for (let i = 0; i < firstDow; i++) cells.push(null);
+  for (let d = 1; d <= dim; d++) cells.push(d);
+  while (cells.length % 7 !== 0) cells.push(null);
+  return React.createElement("div",{role:"grid","aria-label":MONTHS_FULL[month]+" "+year+" execution heatmap"},
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(7, minmax(0, 1fr))",gap:4,marginBottom:6}},
+      DAYS.map(d=>React.createElement("div",{key:d,style:{fontSize:10,color:C.textMuted,textAlign:"center",fontFamily:"'JetBrains Mono',monospace"}},d))
+    ),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(7, minmax(0, 1fr))",gap:4}},
+      cells.map((day,i)=>{
+        if(day===null) return React.createElement("div",{key:i,style:{aspectRatio:"1 / 1"}});
+        const data = aggregateDay(aggregation, month, day, C.accent);
+        return React.createElement("div",{key:i,style:{display:"flex",flexDirection:"column",alignItems:"center",gap:3}},
+          React.createElement(HeatCell,{count:data.total,maxCount:aggregation.max,color:data.color,isToday:false,accentColor:C.accent,size:28,label:String(day),
+            tooltip:MONTHS[month]+" "+day+": "+data.total+" execution"+(data.total!==1?"s":""),
+            onClick:()=>data.total>0&&onDayClick&&onDayClick(year,month,day)}),
+          React.createElement("span",{style:{fontSize:9,color:C.textMuted}},data.total>0?data.total:"")
+        );
+      })
+    )
+  );
+}
+
+function WeekZoom({expressions,year,month,day,onDayClick,C}) {
+  const aggregation = useMemo(()=>buildDayAggregation(expressions, year),[expressions,year]);
+  const selected = new Date(year, month, day);
+  const start = new Date(selected);
+  start.setDate(selected.getDate() - selected.getDay());
+  const days = Array.from({length:7},(_,i)=>new Date(start.getFullYear(), start.getMonth(), start.getDate()+i));
+  return React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(7, minmax(0, 1fr))",gap:8},role:"grid","aria-label":"Week execution heatmap"},
+    days.map(d=>{
+      const inYear = d.getFullYear() === year;
+      const data = inYear ? aggregateDay(aggregation, d.getMonth(), d.getDate(), C.accent) : { total:0, color:C.border };
+      return React.createElement("div",{key:d.toISOString(),style:{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,padding:8,minHeight:86}},
+        React.createElement("div",{style:{fontSize:10,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace",marginBottom:6}},DAYS[d.getDay()]+" "+MONTHS[d.getMonth()]+" "+d.getDate()),
+        React.createElement(HeatCell,{count:data.total,maxCount:aggregation.max,color:data.color,isToday:false,accentColor:C.accent,size:34,label:data.total?String(data.total):"",
+          tooltip:MONTHS[d.getMonth()]+" "+d.getDate()+": "+data.total+" execution"+(data.total!==1?"s":""),
+          onClick:()=>inYear&&data.total>0&&onDayClick&&onDayClick(year,d.getMonth(),d.getDate())})
+      );
+    })
+  );
+}
+
+function ZoomView({mode,year,month,day,expressions,onDayClick,C}) {
+  if (mode === "month") return React.createElement(MonthZoom,{expressions,year,month,onDayClick,C});
+  if (mode === "week") return React.createElement(WeekZoom,{expressions,year,month,day,onDayClick,C});
+  if (mode === "day") return React.createElement(React.Fragment,null,
+    React.createElement(DayDetail,{year,month,day,expressions,onClose:null,C}),
+    React.createElement(GanttStrip,{year,month,day,expressions,C})
+  );
+  return React.createElement(CalendarHeatmap,{expressions,year,onDayClick,C});
+}
+
 function DayDetail({year,month,day,expressions,onClose,C}) {
   const date=new Date(year,month,day);
   const dayName=DAYS[date.getDay()];
@@ -359,7 +842,7 @@ function DayDetail({year,month,day,expressions,onClose,C}) {
   return React.createElement("div",{style:{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:10,padding:16,marginTop:12,animation:"slideIn 0.2s ease"}},
     React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}},
       React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,fontFamily:"'JetBrains Mono',monospace"}},dayName+", "+MONTHS[month]+" "+day+", "+year),
-      React.createElement("button",{onClick:onClose,style:{background:"none",border:"none",color:C.textDim,cursor:"pointer",fontSize:18,lineHeight:1,padding:"2px 6px"}},"\u00d7")
+      onClose?React.createElement("button",{onClick:onClose,style:{background:"none",border:"none",color:C.textDim,cursor:"pointer",fontSize:18,lineHeight:1,padding:"2px 6px"}},"\u00d7"):null
     ),
     details.map((d,i)=>React.createElement("div",{key:i,style:{marginBottom:i<details.length-1?10:0}},
       React.createElement("div",{style:{fontSize:11,color:d.color,fontFamily:"'JetBrains Mono',monospace",marginBottom:4,display:"flex",alignItems:"center",gap:6}},
@@ -368,7 +851,7 @@ function DayDetail({year,month,day,expressions,onClose,C}) {
       ),
       React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:4,paddingLeft:14}},
         d.times.slice(0,48).map((t,j)=>React.createElement("span",{key:j,style:{fontSize:10,color:C.textDim,background:d.color+"15",padding:"2px 6px",borderRadius:4,fontFamily:"'JetBrains Mono',monospace"}},
-          String(t.getHours()).padStart(2,"0")+":"+String(t.getMinutes()).padStart(2,"0")
+          formatRunTime(t)
         )),
         d.times.length>48?React.createElement("span",{style:{fontSize:10,color:C.textMuted}},"+"+( d.times.length-48)+" more"):null
       )
@@ -441,6 +924,51 @@ function HourlyDist({expressions,year,C}) {
           h%3===0?React.createElement("div",{style:{fontSize:8,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace"}},String(h).padStart(2,"0")):null
         );
       })
+    )
+  );
+}
+
+function PolarClock({expressions,year,C}) {
+  const data = useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
+    const times = getFireTimes(e.parsed, year, 5000);
+    const hours = new Array(24).fill(0);
+    for (const t of times) hours[t.getHours()]++;
+    return { hours, color:EC[i%EC.length], label:e.label || e.value };
+  }),[expressions,year]);
+  if (data.length === 0) return null;
+  const maxVal = Math.max(1, ...data.flatMap(d=>d.hours));
+  const cx = 90, cy = 90;
+  const polarToCartesian = (radius, angleDeg) => {
+    const rad = (angleDeg - 90) * Math.PI / 180;
+    return { x:cx + radius * Math.cos(rad), y:cy + radius * Math.sin(rad) };
+  };
+  const arcPath = (radius, startHour, value) => {
+    const start = polarToCartesian(radius, startHour * 15);
+    const end = polarToCartesian(radius, (startHour + 0.86) * 15);
+    return "M "+start.x.toFixed(2)+" "+start.y.toFixed(2)+" A "+radius+" "+radius+" 0 0 1 "+end.x.toFixed(2)+" "+end.y.toFixed(2);
+  };
+  return React.createElement("div",{style:{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:10,padding:14,marginTop:12}},
+    React.createElement("div",{style:{fontSize:12,fontWeight:600,color:C.text,marginBottom:8}},"Polar 24-Hour Clock"),
+    React.createElement("div",{style:{display:"flex",gap:12,alignItems:"center",flexWrap:"wrap"}},
+      React.createElement("svg",{width:180,height:180,viewBox:"0 0 180 180",role:"img","aria-label":"Polar 24-hour schedule density"},
+        React.createElement("circle",{cx,cy,r:70,fill:"none",stroke:C.border,strokeWidth:1}),
+        React.createElement("circle",{cx,cy,r:42,fill:"none",stroke:C.border,strokeWidth:1}),
+        [0,6,12,18].map(h=>{
+          const p = polarToCartesian(78, h * 15);
+          return React.createElement("text",{key:h,x:p.x,y:p.y,fill:C.textMuted,fontSize:9,textAnchor:"middle",dominantBaseline:"middle",fontFamily:"JetBrains Mono"},String(h).padStart(2,"0"));
+        }),
+        data.flatMap((d,di)=>d.hours.map((value,h)=>{
+          if (!value) return null;
+          const radius = 36 + di * 8 + Math.min(22, value / maxVal * 22);
+          return React.createElement("path",{key:di+"-"+h,d:arcPath(radius,h,value),fill:"none",stroke:d.color,strokeWidth:5,strokeLinecap:"round",opacity:0.85});
+        }))
+      ),
+      React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:5,minWidth:180}},
+        data.map((d,i)=>React.createElement("div",{key:i,style:{display:"flex",alignItems:"center",gap:6,fontSize:11,color:C.textDim}},
+          React.createElement("span",{style:{width:8,height:8,borderRadius:2,background:d.color}}),
+          React.createElement("span",null,d.label)
+        ))
+      )
     )
   );
 }
@@ -539,7 +1067,7 @@ function DiffView({exprA, exprB, idxA, idxB, year, C}) {
 function GanttStrip({year,month,day,expressions,C}) {
   const strips = useMemo(() => expressions.filter(e=>e.parsed).map((e,i) => {
     const times = getFireTimes(e.parsed, year, 5000).filter(t => t.getMonth() === month && t.getDate() === day);
-    const minutes = times.map(t => t.getHours() * 60 + t.getMinutes());
+    const minutes = times.map(t => ({ value:t.getHours() * 60 + t.getMinutes() + (t.getSeconds ? t.getSeconds() : 0) / 60, label:formatRunTime(t) }));
     return { label: e.label || e.value, color: EC[i % EC.length], minutes, count: times.length };
   }).filter(s => s.count > 0), [expressions, year, month, day]);
   if (strips.length === 0) return null;
@@ -553,8 +1081,8 @@ function GanttStrip({year,month,day,expressions,C}) {
         s.label+" ("+s.count+" run"+(s.count!==1?"s":"")+")"
       ),
       React.createElement("div",{style:{position:"relative",height:12,background:C.border+"44",borderRadius:3,overflow:"hidden"}},
-        s.minutes.map((m,j) => React.createElement("div",{key:j,title:String(Math.floor(m/60)).padStart(2,"0")+":"+String(m%60).padStart(2,"0"),
-          style:{position:"absolute",left:(m/totalMin*100)+"%",width:Math.max(1,100/totalMin*2)+"%",height:"100%",backgroundColor:s.color,opacity:0.8}}))
+        s.minutes.map((m,j) => React.createElement("div",{key:j,title:m.label,
+          style:{position:"absolute",left:(m.value/totalMin*100)+"%",width:Math.max(1,100/totalMin*2)+"%",height:"100%",backgroundColor:s.color,opacity:0.8}}))
       )
     )),
     // Hour markers
@@ -577,6 +1105,16 @@ function encodeURLState(expressions, year) {
   return params.toString();
 }
 
+function encodeAppState(expressions, year, options) {
+  const params = new URLSearchParams(encodeURLState(expressions, year));
+  const opts = getParseOptions(options);
+  if (opts.dialect !== DEFAULT_PARSE_OPTIONS.dialect) params.set("dialect", opts.dialect);
+  if (opts.fieldMode !== DEFAULT_PARSE_OPTIONS.fieldMode) params.set("mode", opts.fieldMode);
+  if (opts.timezone !== DEFAULT_PARSE_OPTIONS.timezone) params.set("tz", opts.timezone);
+  if (opts.dstAware) params.set("dst", "1");
+  return params.toString();
+}
+
 function decodeURLState() {
   const params = new URLSearchParams(window.location.search);
   const exprs = [];
@@ -590,7 +1128,11 @@ function decodeURLState() {
     }
   }
   const year = params.has("year") ? parseInt(params.get("year"), 10) : null;
-  return { exprs: exprs.length > 0 ? exprs : null, year: year && !isNaN(year) ? year : null };
+  const dialect = DIALECTS[params.get("dialect")] ? params.get("dialect") : DEFAULT_PARSE_OPTIONS.dialect;
+  const mode = FIELD_MODE_LABELS[params.get("mode")] ? params.get("mode") : DEFAULT_PARSE_OPTIONS.fieldMode;
+  const timezone = params.get("tz") || DEFAULT_PARSE_OPTIONS.timezone;
+  const dstAware = params.get("dst") === "1";
+  return { exprs: exprs.length > 0 ? exprs : null, year: year && !isNaN(year) ? year : null, dialect, mode, timezone, dstAware };
 }
 
 // --- localStorage schedule sets ---
@@ -634,12 +1176,34 @@ function parseCrontabLines(text) {
     .filter(Boolean);
 }
 
+function parseKubernetesCronJobs(text) {
+  const found = [];
+  const docs = text.split(/^---\s*$/m);
+  docs.forEach((doc, idx) => {
+    const schedule = doc.match(/^\s*schedule:\s*["']?([^"'\n#]+)["']?/m);
+    if (!schedule) return;
+    const name = doc.match(/^\s*name:\s*["']?([^"'\n#]+)["']?/m);
+    found.push({ value:schedule[1].trim(), label:name ? name[1].trim() : "CronJob "+(idx+1) });
+  });
+  return found;
+}
+
+function parseImportText(text) {
+  const yaml = parseKubernetesCronJobs(text);
+  const crontab = parseCrontabLines(text);
+  const byKey = new Map();
+  [...yaml, ...crontab].forEach(item => byKey.set(item.value+"|"+item.label, item));
+  return [...byKey.values()];
+}
+
 // --- Markdown report generator ---
-function generateMarkdownReport(expressions, year) {
+function generateMarkdownReport(expressions, year, options) {
   const lines = [];
   lines.push("# CronScope Schedule Report");
   lines.push("");
   lines.push("**Year:** " + year);
+  lines.push("**Dialect:** " + getDialectConfig(getParseOptions(options).dialect).label);
+  lines.push("**Timezone:** " + (getParseOptions(options).timezone === "local" ? LOCAL_TIMEZONE + " (local)" : getParseOptions(options).timezone));
   lines.push("**Generated:** " + new Date().toISOString().slice(0, 10));
   lines.push("");
   const valid = expressions.filter(e => e.parsed);
@@ -649,7 +1213,7 @@ function generateMarkdownReport(expressions, year) {
   lines.push("| # | Label | Expression | Description |");
   lines.push("|---|-------|------------|-------------|");
   valid.forEach((e, i) => {
-    lines.push("| " + (i + 1) + " | " + (e.label || "-") + " | `" + e.value + "` | " + describeCron(e.value) + " |");
+    lines.push("| " + (i + 1) + " | " + (e.label || "-") + " | `" + e.value + "` | " + describeCron(e.value, options) + " |");
   });
   lines.push("");
   lines.push("## Statistics");
@@ -694,16 +1258,155 @@ function generateMarkdownReport(expressions, year) {
   return lines.join("\n");
 }
 
+function buildHeatmapSvg(expressions, year, mode, month, day, C) {
+  const aggregation = buildDayAggregation(expressions, year);
+  const cell = mode === "year" ? 10 : 20;
+  const gap = 2;
+  const left = 50;
+  const top = 34;
+  const width = mode === "year" ? 760 : 520;
+  const height = mode === "year" ? 360 : 260;
+  const parts = [];
+  parts.push('<svg xmlns="http://www.w3.org/2000/svg" width="'+width+'" height="'+height+'" viewBox="0 0 '+width+' '+height+'">');
+  parts.push('<rect width="100%" height="100%" fill="'+C.bg+'"/>');
+  parts.push('<text x="20" y="22" fill="'+C.text+'" font-family="Inter, Arial" font-size="16" font-weight="700">CronScope '+year+' '+mode+' export</text>');
+  const drawCell = (x,y,count,color,label) => {
+    const opacity = count===0?0:Math.max(0.15,Math.min(1,count/Math.max(aggregation.max,1)));
+    const fill = count===0 ? "transparent" : color + Math.round(opacity*220).toString(16).padStart(2,"0");
+    parts.push('<rect x="'+x+'" y="'+y+'" width="'+cell+'" height="'+cell+'" rx="2" fill="'+fill+'" stroke="'+(count?color:C.border)+'" stroke-opacity="0.35"/>');
+    if (label && cell >= 18) parts.push('<text x="'+(x+cell/2)+'" y="'+(y+cell/2+3)+'" fill="'+C.text+'" font-family="JetBrains Mono, monospace" font-size="8" text-anchor="middle">'+label+'</text>');
+  };
+  if (mode === "month" || mode === "week" || mode === "day") {
+    const targetMonth = month || 0;
+    const dim = new Date(year, targetMonth+1, 0).getDate();
+    const firstDow = new Date(year, targetMonth, 1).getDay();
+    for (let d = 1; d <= dim; d++) {
+      const idx = firstDow + d - 1;
+      const x = left + (idx % 7) * (cell + gap);
+      const y = top + Math.floor(idx / 7) * (cell + gap);
+      const data = aggregateDay(aggregation, targetMonth, d, C.accent);
+      drawCell(x,y,data.total,data.color,String(d));
+    }
+  } else {
+    MONTHS.forEach((mName,mIdx)=>{
+      const rowTop = top + mIdx * 26;
+      parts.push('<text x="15" y="'+(rowTop+9)+'" fill="'+C.textMuted+'" font-family="JetBrains Mono, monospace" font-size="10">'+mName+'</text>');
+      const dim = new Date(year,mIdx+1,0).getDate();
+      const firstDow = new Date(year,mIdx,1).getDay();
+      for (let d=1; d<=dim; d++) {
+        const idx = firstDow + d - 1;
+        const x = left + Math.floor(idx/7) * (cell + gap);
+        const y = rowTop + (idx % 7) * (cell + gap);
+        const data = aggregateDay(aggregation,mIdx,d,C.accent);
+        drawCell(x,y,data.total,data.color,"");
+      }
+    });
+  }
+  parts.push('</svg>');
+  return parts.join("");
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
+function exportSvg(expressions, year, mode, month, day, C) {
+  const svg = buildHeatmapSvg(expressions, year, mode, month, day, C);
+  downloadBlob(new Blob([svg], { type:"image/svg+xml" }), "cronscope-"+year+"-"+mode+".svg");
+}
+
+function exportPng(expressions, year, mode, month, day, C, done) {
+  const svg = buildHeatmapSvg(expressions, year, mode, month, day, C);
+  const img = new Image();
+  const url = URL.createObjectURL(new Blob([svg], { type:"image/svg+xml" }));
+  img.onload = () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    canvas.toBlob(blob => {
+      if (blob) downloadBlob(blob, "cronscope-"+year+"-"+mode+".png");
+      URL.revokeObjectURL(url);
+      done && done();
+    }, "image/png", 0.95);
+  };
+  img.src = url;
+}
+
+function timestampMatches(parsed, date) {
+  if (!parsed) return { matches:false, reasons:["Expression is invalid."] };
+  const y = date.getFullYear(), month = date.getMonth()+1, day = date.getDate();
+  const reasons = [];
+  if (parsed.years && !parsed.years.has(y)) reasons.push("Year "+y+" is not selected.");
+  if (!parsed.months.has(month)) reasons.push("Month "+month+" is not selected.");
+  if (!matchesScheduleDate(parsed, y, month, day)) reasons.push("Day "+day+" / "+DAYS[date.getDay()]+" does not match day fields.");
+  if (!parsed.hours.has(date.getHours())) reasons.push("Hour "+date.getHours()+" is not selected.");
+  if (!parsed.minutes.has(date.getMinutes())) reasons.push("Minute "+date.getMinutes()+" is not selected.");
+  if (!parsed.seconds.has(date.getSeconds())) reasons.push("Second "+date.getSeconds()+" is not selected.");
+  return { matches:reasons.length===0, reasons };
+}
+
+function findNeighborRun(parsed, pivot, direction) {
+  if (!parsed) return null;
+  const years = direction > 0 ? [pivot.getFullYear(), pivot.getFullYear()+1] : [pivot.getFullYear(), pivot.getFullYear()-1];
+  const all = years.flatMap(y=>getFireTimes(parsed, y, 20000)).sort((a,b)=>a-b);
+  if (direction > 0) return all.find(t=>t>pivot) || null;
+  for (let i=all.length-1; i>=0; i--) if (all[i] < pivot) return all[i];
+  return null;
+}
+
+function WhyDebugger({expressions,debugExpressionId,setDebugExpressionId,debugTimestamp,setDebugTimestamp,C}) {
+  const valid = expressions.filter(e=>e.parsed);
+  if (valid.length === 0) return null;
+  const selected = valid.find(e=>String(e.id)===String(debugExpressionId)) || valid[0];
+  const pivot = debugTimestamp ? new Date(debugTimestamp) : new Date();
+  const result = isNaN(pivot.getTime()) ? { matches:false, reasons:["Enter a valid timestamp."] } : timestampMatches(selected.parsed, pivot);
+  const prev = isNaN(pivot.getTime()) ? null : findNeighborRun(selected.parsed, pivot, -1);
+  const next = isNaN(pivot.getTime()) ? null : findNeighborRun(selected.parsed, pivot, 1);
+  return React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:14}},
+    React.createElement("div",{style:{fontSize:11,fontWeight:600,color:C.textDim,marginBottom:8,textTransform:"uppercase",letterSpacing:"0.05em"}},"Why Didn't It Fire?"),
+    React.createElement("select",{value:selected.id,onChange:ev=>setDebugExpressionId(ev.target.value),"aria-label":"Expression to debug",
+      style:{width:"100%",background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:11,marginBottom:8}},
+      valid.map(e=>React.createElement("option",{key:e.id,value:e.id},e.label||e.value))
+    ),
+    React.createElement("input",{type:"datetime-local",value:debugTimestamp,onChange:ev=>setDebugTimestamp(ev.target.value),"aria-label":"Timestamp to debug",
+      style:{width:"100%",background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:11,marginBottom:8}}),
+    React.createElement("div",{style:{fontSize:11,color:result.matches?C.green:C.orange,lineHeight:1.5,marginBottom:6}},
+      result.matches ? "This timestamp matches." : result.reasons.join(" ")
+    ),
+    React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,fontSize:10,color:C.textDim,fontFamily:"'JetBrains Mono',monospace"}},
+      React.createElement("div",null,"Prev: ",prev?MONTHS[prev.getMonth()]+" "+prev.getDate()+" "+formatRunTime(prev):"--"),
+      React.createElement("div",null,"Next: ",next?MONTHS[next.getMonth()]+" "+next.getDate()+" "+formatRunTime(next):"--")
+    )
+  );
+}
+
 function App() {
   // Load initial state from URL or defaults
   const urlState = useMemo(() => decodeURLState(), []);
+  const initialOptions = { dialect:urlState.dialect, fieldMode:urlState.mode, timezone:urlState.timezone, dstAware:urlState.dstAware };
   const initialExprs = urlState.exprs
-    ? urlState.exprs.map((e, i) => ({ id: i + 1, value: e.value, label: e.label, parsed: parseCron(e.value) }))
-    : [{ id: 1, value: "0 9 * * 1-5", label: "Weekday morning", parsed: parseCron("0 9 * * 1-5") }];
+    ? urlState.exprs.map((e, i) => ({ id: i + 1, value: e.value, label: e.label, parsed: parseCron(e.value, initialOptions) }))
+    : [{ id: 1, value: "0 9 * * 1-5", label: "Weekday morning", parsed: parseCron("0 9 * * 1-5", initialOptions) }];
   const initialYear = urlState.year || new Date().getFullYear();
 
   const [expressions, setExpressions] = useState(initialExprs);
   const [year, setYear] = useState(initialYear);
+  const [dialect, setDialect] = useState(urlState.dialect);
+  const [fieldMode, setFieldMode] = useState(urlState.mode);
+  const [timezone, setTimezone] = useState(urlState.timezone);
+  const [dstAware, setDstAware] = useState(urlState.dstAware);
+  const [zoomMode, setZoomMode] = useState("year");
+  const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
+  const [selectedDay, setSelectedDay] = useState(new Date().getDate());
   const [dayDetail, setDayDetail] = useState(null);
   const [showPresets, setShowPresets] = useState(false);
   const [activePresetTarget, setActivePresetTarget] = useState(null);
@@ -717,8 +1420,11 @@ function App() {
   const [diffMode, setDiffMode] = useState(false);
   const [diffA, setDiffA] = useState(0);
   const [diffB, setDiffB] = useState(1);
+  const [debugTimestamp, setDebugTimestamp] = useState("");
+  const [debugExpressionId, setDebugExpressionId] = useState("");
   const nextId = useRef(initialExprs.length + 1);
   const C = THEMES[theme];
+  const parseOptions = useMemo(()=>({ dialect, fieldMode, timezone, dstAware }),[dialect,fieldMode,timezone,dstAware]);
 
   // Apply theme class to body
   useEffect(() => {
@@ -729,52 +1435,70 @@ function App() {
   // Sync URL with current state (debounced)
   useEffect(() => {
     const timeout = setTimeout(() => {
-      const qs = encodeURLState(expressions, year);
+      const qs = encodeAppState(expressions, year, parseOptions);
       const newUrl = window.location.pathname + (qs ? "?" + qs : "");
       window.history.replaceState(null, "", newUrl);
     }, 300);
     return () => clearTimeout(timeout);
-  }, [expressions, year]);
+  }, [expressions, year, parseOptions]);
 
-  const updateExpr=useCallback((id,value)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,value,parsed:parseCron(value)}:e));},[]);
+  useEffect(() => {
+    FIRE_TIME_CACHE.clear();
+    setExpressions(prev=>prev.map(e=>({...e,parsed:parseCron(e.value,parseOptions)})));
+  }, [parseOptions]);
+
+  useEffect(() => {
+    if ("serviceWorker" in navigator && window.location.protocol.startsWith("http")) {
+      navigator.serviceWorker.register("./sw.js").catch(()=>{});
+    }
+  }, []);
+
+  const updateExpr=useCallback((id,value)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,value,parsed:parseCron(value,parseOptions)}:e));},[parseOptions]);
   const updateLabel=useCallback((id,label)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,label}:e));},[]);
   const addExpr=useCallback(()=>{const id=nextId.current++;setExpressions(prev=>[...prev,{id,value:"",label:"",parsed:null}]);},[]);
   const removeExpr=useCallback((id)=>{setExpressions(prev=>prev.filter(e=>e.id!==id));},[]);
   const applyPreset=useCallback((preset)=>{
-    if(activePresetTarget!==null) setExpressions(prev=>prev.map(e=>e.id===activePresetTarget?{...e,value:preset.expr,label:preset.label,parsed:parseCron(preset.expr)}:e));
+    if(activePresetTarget!==null) setExpressions(prev=>prev.map(e=>e.id===activePresetTarget?{...e,value:preset.expr,label:preset.label,parsed:parseCron(preset.expr,parseOptions)}:e));
     setShowPresets(false);setActivePresetTarget(null);
-  },[activePresetTarget]);
+  },[activePresetTarget,parseOptions]);
 
   // Import crontab
   const handleImport = useCallback(() => {
-    const parsed = parseCrontabLines(importText);
+    const parsed = parseImportText(importText);
     if (parsed.length === 0) return;
     setExpressions(prev => {
-      const newExprs = parsed.map((p, i) => ({ id: nextId.current++, value: p.value, label: p.label, parsed: parseCron(p.value) }));
+      const newExprs = parsed.map((p, i) => ({ id: nextId.current++, value: p.value, label: p.label, parsed: parseCron(p.value,parseOptions) }));
       return [...prev, ...newExprs];
     });
     setShowImport(false);
     setImportText("");
-  }, [importText]);
+  }, [importText,parseOptions]);
 
   // Save current schedule set
   const handleSaveSet = useCallback(() => {
     const name = setNameInput.trim();
     if (!name) return;
-    const set = { name, exprs: expressions.map(e => ({ value: e.value, label: e.label })), savedAt: new Date().toISOString() };
+    const set = { name, exprs: expressions.map(e => ({ value: e.value, label: e.label })), options:parseOptions, savedAt: new Date().toISOString() };
     const updated = [...scheduleSets, set];
     setScheduleSets(updated);
     saveScheduleSets(updated);
     setSetNameInput("");
-  }, [setNameInput, expressions, scheduleSets]);
+  }, [setNameInput, expressions, scheduleSets, parseOptions]);
 
   // Load a schedule set
   const handleLoadSet = useCallback((set) => {
+    if (set.options) {
+      if (DIALECTS[set.options.dialect]) setDialect(set.options.dialect);
+      if (FIELD_MODE_LABELS[set.options.fieldMode]) setFieldMode(set.options.fieldMode);
+      if (set.options.timezone) setTimezone(set.options.timezone);
+      setDstAware(!!set.options.dstAware);
+    }
     nextId.current = 1;
-    const loaded = set.exprs.map((e, i) => ({ id: nextId.current++, value: e.value, label: e.label, parsed: parseCron(e.value) }));
+    const opts = set.options || parseOptions;
+    const loaded = set.exprs.map((e, i) => ({ id: nextId.current++, value: e.value, label: e.label, parsed: parseCron(e.value, opts) }));
     setExpressions(loaded);
     setShowSets(false);
-  }, []);
+  }, [parseOptions]);
 
   // Delete a schedule set
   const handleDeleteSet = useCallback((idx) => {
@@ -785,32 +1509,45 @@ function App() {
 
   // Copy as markdown (plain-English translations)
   const handleCopyMarkdown = useCallback(() => {
-    const lines = expressions.filter(e => e.parsed).map(e => "- **" + (e.label || e.value) + "**: " + describeCron(e.value));
+    const lines = expressions.filter(e => e.parsed).map(e => "- **" + (e.label || e.value) + "**: " + describeCron(e.value,parseOptions));
     if (lines.length === 0) return;
     navigator.clipboard.writeText(lines.join("\n")).then(() => {
       setCopyFeedback({ type: "copy", msg: "Copied!" });
       setTimeout(() => setCopyFeedback(null), 2000);
     });
-  }, [expressions]);
+  }, [expressions,parseOptions]);
 
   // Export full markdown report
   const handleExportReport = useCallback(() => {
-    const report = generateMarkdownReport(expressions, year);
+    const report = generateMarkdownReport(expressions, year, parseOptions);
     navigator.clipboard.writeText(report).then(() => {
       setCopyFeedback({ type: "export", msg: "Report copied!" });
       setTimeout(() => setCopyFeedback(null), 2000);
     });
-  }, [expressions, year]);
+  }, [expressions, year, parseOptions]);
 
   // Share permalink
   const handleShareLink = useCallback(() => {
-    const qs = encodeURLState(expressions, year);
+    const qs = encodeAppState(expressions, year, parseOptions);
     const url = window.location.origin + window.location.pathname + (qs ? "?" + qs : "");
     navigator.clipboard.writeText(url).then(() => {
       setCopyFeedback({ type: "share", msg: "Link copied!" });
       setTimeout(() => setCopyFeedback(null), 2000);
     });
-  }, [expressions, year]);
+  }, [expressions, year, parseOptions]);
+
+  const handleExportSvg = useCallback(() => {
+    exportSvg(expressions, year, zoomMode, selectedMonth, selectedDay, C);
+    setCopyFeedback({ type:"svg", msg:"SVG exported!" });
+    setTimeout(() => setCopyFeedback(null), 2000);
+  }, [expressions, year, zoomMode, selectedMonth, selectedDay, C]);
+
+  const handleExportPng = useCallback(() => {
+    exportPng(expressions, year, zoomMode, selectedMonth, selectedDay, C, () => {
+      setCopyFeedback({ type:"png", msg:"PNG exported!" });
+      setTimeout(() => setCopyFeedback(null), 2000);
+    });
+  }, [expressions, year, zoomMode, selectedMonth, selectedDay, C]);
 
   const nextRuns=useMemo(()=>{
     const now=new Date();const allRuns=[];
@@ -832,7 +1569,7 @@ function App() {
       // Header
       React.createElement("div",{style:{marginBottom:28,display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}},
         React.createElement("h1",{style:{fontFamily:"'Outfit',sans-serif",fontSize:28,fontWeight:800,background:"linear-gradient(135deg,"+C.accent+","+C.purple+")",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent",letterSpacing:"-0.02em"}},"CronScope"),
-        React.createElement("span",{style:{fontSize:11,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace"}},"v0.2.0"),
+        React.createElement("span",{style:{fontSize:11,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace"}},"v"+VERSION),
         React.createElement("span",{style:{fontSize:12,color:C.textDim,marginLeft:"auto",marginRight:8}},"Cron Expression Simulator + Calendar Visualizer"),
 
         // Theme toggle button
@@ -870,7 +1607,7 @@ function App() {
               React.createElement("input",{value:e.value,onChange:ev=>updateExpr(e.id,ev.target.value),placeholder:"* * * * *  (min hr dom mon dow)",spellCheck:false,"aria-label":"Cron expression","aria-invalid":!isValid?"true":undefined,
                 style:{width:"100%",padding:"8px 12px",background:C.surface,border:"1px solid "+(isValid?C.border:C.error),borderRadius:8,color:C.text,fontSize:14,fontFamily:"'JetBrains Mono',monospace",letterSpacing:"0.05em",transition:"border-color 0.15s"},
                 onFocus:ev=>{ev.target.style.borderColor=isValid?C.accent:C.error;},onBlur:ev=>{ev.target.style.borderColor=isValid?C.border:C.error;}}),
-              e.parsed?React.createElement("div",{style:{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:10,color:C.textMuted,maxWidth:"40%",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",pointerEvents:"none"}},describeCron(e.value)):null
+              e.parsed?React.createElement("div",{style:{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",fontSize:10,color:C.textMuted,maxWidth:"40%",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",pointerEvents:"none"}},describeCron(e.value,parseOptions)):null
             ),
             React.createElement("button",{onClick:()=>{setActivePresetTarget(e.id);setShowPresets(true);},title:"Presets","aria-label":"Open presets",
               style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 10px",cursor:"pointer",color:C.textDim,fontSize:12,transition:"all 0.15s"},
@@ -888,7 +1625,7 @@ function App() {
         }),
         // Validation panel with per-field errors and suggestions
         expressions.filter(e=>e.value.trim()!==""&&!e.parsed).map(e=>{
-          const v=validateCronExpr(e.value);
+          const v=validateCronExpr(e.value,parseOptions);
           return React.createElement("div",{key:"val-"+e.id,style:{fontSize:11,color:C.error,paddingLeft:22,marginBottom:4,background:C.errorDim,borderRadius:8,padding:"8px 12px",border:"1px solid "+C.error+"33"},role:"alert"},
             React.createElement("div",{style:{fontWeight:600,marginBottom:v.suggestions.length>0?4:0}},(e.label||"Expression")+": Invalid"),
             v.fields.filter(f=>f.error).map((f,i)=>React.createElement("div",{key:i,style:{display:"flex",gap:6,alignItems:"center",marginBottom:2}},
@@ -898,6 +1635,31 @@ function App() {
             v.suggestions.map((s,i)=>React.createElement("div",{key:"s"+i,style:{color:C.orange,marginTop:2}},s))
           );
         }),
+        React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(4, minmax(130px, 1fr))",gap:8,paddingLeft:22,alignItems:"end"}},
+          React.createElement("label",{style:{display:"flex",flexDirection:"column",gap:4,fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:"0.05em"}},
+            "Dialect",
+            React.createElement("select",{value:dialect,onChange:ev=>setDialect(ev.target.value),style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:12}},
+              Object.entries(DIALECTS).map(([key,value])=>React.createElement("option",{key:key,value:key},value.label))
+            )
+          ),
+          React.createElement("label",{style:{display:"flex",flexDirection:"column",gap:4,fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:"0.05em"}},
+            "Field mode",
+            React.createElement("select",{value:fieldMode,onChange:ev=>setFieldMode(ev.target.value),style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:12}},
+              Object.entries(FIELD_MODE_LABELS).map(([key,label])=>React.createElement("option",{key:key,value:key},label))
+            )
+          ),
+          React.createElement("label",{style:{display:"flex",flexDirection:"column",gap:4,fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:"0.05em"}},
+            "Timezone",
+            React.createElement("input",{value:timezone,onChange:ev=>setTimezone(ev.target.value),list:"timezone-options",placeholder:"IANA timezone",style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:12}})
+          ),
+          React.createElement("label",{style:{display:"flex",gap:8,alignItems:"center",fontSize:12,color:C.textDim,padding:"8px 0"}},
+            React.createElement("input",{type:"checkbox",checked:dstAware,onChange:ev=>setDstAware(ev.target.checked)}),
+            "DST-aware rendering"
+          ),
+          React.createElement("datalist",{id:"timezone-options"},
+            TIMEZONE_OPTIONS.map(tz=>React.createElement("option",{key:tz,value:tz}))
+          )
+        ),
         React.createElement("div",{style:{display:"flex",gap:8,paddingLeft:22,alignItems:"center",flexWrap:"wrap"}},
           React.createElement("button",{onClick:addExpr,
             style:{background:C.accentGlow,border:"1px solid "+C.accentDim,borderRadius:8,padding:"6px 14px",color:C.accent,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
@@ -908,7 +1670,7 @@ function App() {
             style:{background:"transparent",border:"1px solid "+C.border,borderRadius:8,padding:"6px 14px",color:C.textDim,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
             onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;ev.currentTarget.style.color=C.accent;},
             onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;ev.currentTarget.style.color=C.textDim;}},
-            "Import Crontab"
+            "Import"
           ),
           React.createElement("button",{onClick:()=>setShowSets(true),
             style:{background:"transparent",border:"1px solid "+C.border,borderRadius:8,padding:"6px 14px",color:C.textDim,fontSize:12,cursor:"pointer",fontWeight:500,transition:"all 0.15s"},
@@ -917,7 +1679,7 @@ function App() {
             "Schedule Sets"
           ),
           React.createElement("div",{style:{fontSize:11,color:C.textMuted,display:"flex",alignItems:"center",gap:4}},
-            FIELD_NAMES.map((f,i)=>React.createElement("span",{key:i,style:{background:C.surface,padding:"2px 6px",borderRadius:4,fontFamily:"'JetBrains Mono',monospace"}},f))
+            getFieldNames(parseOptions).map((f,i)=>React.createElement("span",{key:i,style:{background:C.surface,padding:"2px 6px",borderRadius:4,fontFamily:"'JetBrains Mono',monospace"}},f))
           )
         )
       ),
@@ -943,9 +1705,19 @@ function App() {
       showImport?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
         onClick:()=>{setShowImport(false);setImportText("");},role:"dialog","aria-label":"Import crontab"},
         React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:520,animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
-          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}},"Import Crontab"),
-          React.createElement("div",{style:{fontSize:11,color:C.textDim,marginBottom:12}},"Paste a crontab file below. Lines starting with # are ignored. Each valid line becomes an expression."),
-          React.createElement("textarea",{value:importText,onChange:ev=>setImportText(ev.target.value),placeholder:"# Example crontab\n*/5 * * * * /usr/bin/check-health\n0 9 * * MON-FRI /usr/bin/daily-report\n@daily /usr/bin/cleanup",
+          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}},"Import Schedules"),
+          React.createElement("div",{style:{fontSize:11,color:C.textDim,marginBottom:12}},"Paste or drop crontab text or Kubernetes CronJob YAML. Lines starting with # are ignored."),
+          React.createElement("textarea",{value:importText,onChange:ev=>setImportText(ev.target.value),
+            onDragOver:ev=>{ev.preventDefault();ev.currentTarget.style.borderColor=C.accent;},
+            onDragLeave:ev=>{ev.currentTarget.style.borderColor=C.border;},
+            onDrop:ev=>{
+              ev.preventDefault();
+              ev.currentTarget.style.borderColor=C.border;
+              const file = ev.dataTransfer.files && ev.dataTransfer.files[0];
+              if (file) file.text().then(text=>setImportText(text));
+              else setImportText(ev.dataTransfer.getData("text") || importText);
+            },
+            placeholder:"# Example crontab\n*/5 * * * * /usr/bin/check-health\n0 9 * * MON-FRI /usr/bin/daily-report\n---\napiVersion: batch/v1\nkind: CronJob\nmetadata:\n  name: nightly-report\nspec:\n  schedule: \"0 2 * * *\"",
             style:{width:"100%",height:160,padding:12,background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,color:C.text,fontSize:12,fontFamily:"'JetBrains Mono',monospace",resize:"vertical"},
             "aria-label":"Crontab content"
           }),
@@ -996,6 +1768,18 @@ function App() {
         React.createElement("button",{onClick:()=>setYear(y=>y+1),"aria-label":"Next year",style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"4px 12px",cursor:"pointer",color:C.textDim,fontSize:14,transition:"all 0.15s"},
           onMouseEnter:ev=>{ev.currentTarget.style.borderColor=C.accent;},onMouseLeave:ev=>{ev.currentTarget.style.borderColor=C.border;}},"\u2192"),
         React.createElement("button",{onClick:()=>setYear(new Date().getFullYear()),style:{background:"none",border:"none",color:C.accent,fontSize:11,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},"today"),
+        React.createElement("div",{style:{display:"flex",gap:4,marginLeft:8}},
+          ["year","month","week","day"].map(mode=>React.createElement("button",{key:mode,onClick:()=>setZoomMode(mode),
+            style:{background:zoomMode===mode?C.accentGlow:C.surface,border:"1px solid "+(zoomMode===mode?C.accent:C.border),borderRadius:8,padding:"4px 9px",cursor:"pointer",color:zoomMode===mode?C.accent:C.textDim,fontSize:11,textTransform:"capitalize",fontFamily:"'JetBrains Mono',monospace"}},
+            mode
+          ))
+        ),
+        zoomMode!=="year"?React.createElement("select",{value:selectedMonth,onChange:ev=>setSelectedMonth(Number(ev.target.value)),"aria-label":"Selected month",
+          style:{background:C.surface,border:"1px solid "+C.border,borderRadius:6,padding:"3px 6px",color:C.text,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}},
+          MONTHS.map((m,i)=>React.createElement("option",{key:m,value:i},m))
+        ):null,
+        (zoomMode==="week"||zoomMode==="day")?React.createElement("input",{type:"number",min:1,max:new Date(year,selectedMonth+1,0).getDate(),value:selectedDay,onChange:ev=>setSelectedDay(Math.max(1,Math.min(new Date(year,selectedMonth+1,0).getDate(),Number(ev.target.value)||1))),"aria-label":"Selected day",
+          style:{width:56,background:C.surface,border:"1px solid "+C.border,borderRadius:6,padding:"3px 6px",color:C.text,fontSize:11,fontFamily:"'JetBrains Mono',monospace"}}):null,
         // Diff mode toggle (only when 2+ valid expressions)
         expressions.filter(e=>e.parsed).length>=2?React.createElement("button",{onClick:()=>setDiffMode(d=>!d),
           style:{background:diffMode?C.accentGlow:C.surface,border:"1px solid "+(diffMode?C.accent:C.border),borderRadius:8,padding:"4px 12px",cursor:"pointer",color:diffMode?C.accent:C.textDim,fontSize:11,transition:"all 0.15s",fontFamily:"'JetBrains Mono',monospace",marginLeft:8},
@@ -1023,24 +1807,26 @@ function App() {
           React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:18}},
             React.createElement("div",{style:{fontSize:12,fontWeight:600,color:C.textDim,marginBottom:12,display:"flex",gap:6,alignItems:"center"}},
               React.createElement("span",null,"EXECUTION HEATMAP"),
+              React.createElement("span",{style:{fontSize:10,color:C.accent,fontWeight:500,textTransform:"uppercase"}},zoomMode),
               React.createElement("span",{style:{fontSize:10,color:C.textMuted,fontWeight:400}},"Click a cell for details")
             ),
-            React.createElement("div",{style:{display:"flex",gap:4,marginBottom:10}},
+            zoomMode==="year"?React.createElement("div",{style:{display:"flex",gap:4,marginBottom:10}},
               React.createElement("div",{style:{width:40}}),
               DAYS.map(d=>React.createElement("div",{key:d,style:{fontSize:8,color:C.textMuted,width:13,textAlign:"center",fontFamily:"'JetBrains Mono',monospace"}},d[0]))
-            ),
-            React.createElement(CalendarHeatmap,{expressions,year,onDayClick:(y,m,d)=>setDayDetail({year:y,month:m,day:d}),C}),
+            ):null,
+            React.createElement(ZoomView,{mode:zoomMode,expressions,year,month:selectedMonth,day:selectedDay,onDayClick:(y,m,d)=>{setSelectedMonth(m);setSelectedDay(d);setDayDetail({year:y,month:m,day:d});},C}),
             React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8,marginTop:12,paddingLeft:40}},
               React.createElement("span",{style:{fontSize:9,color:C.textMuted}},"Less"),
               [0.1,0.3,0.5,0.7,1].map((opacity,i)=>React.createElement("div",{key:i,style:{width:10,height:10,borderRadius:2,backgroundColor:C.accent+Math.round(opacity*200).toString(16).padStart(2,"0")}})),
               React.createElement("span",{style:{fontSize:9,color:C.textMuted}},"More")
             )
           ),
-          dayDetail?React.createElement(DayDetail,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,onClose:()=>setDayDetail(null),C}):null,
-          dayDetail?React.createElement(GanttStrip,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,C}):null,
+          zoomMode!=="day"&&dayDetail?React.createElement(DayDetail,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,onClose:()=>setDayDetail(null),C}):null,
+          zoomMode!=="day"&&dayDetail?React.createElement(GanttStrip,{year:dayDetail.year,month:dayDetail.month,day:dayDetail.day,expressions,C}):null,
           diffMode&&expressions[diffA]&&expressions[diffB]&&expressions[diffA].parsed&&expressions[diffB].parsed&&diffA!==diffB
             ?React.createElement(DiffView,{exprA:expressions[diffA],exprB:expressions[diffB],idxA:diffA,idxB:diffB,year,C}):null,
           React.createElement("div",{style:{marginTop:16}},React.createElement(HourlyDist,{expressions,year,C})),
+          React.createElement(PolarClock,{expressions,year,C}),
           React.createElement(ConflictDetector,{expressions,year,C})
         ),
 
@@ -1058,7 +1844,7 @@ function App() {
             ),
             expressions.filter(e=>e.parsed).map((e,i)=>React.createElement("div",{key:e.id,style:{fontSize:12,color:C.text,marginBottom:6,display:"flex",alignItems:"flex-start",gap:6,lineHeight:1.5}},
               React.createElement("span",{style:{width:6,height:6,borderRadius:"50%",background:EC[i%EC.length],flexShrink:0,marginTop:5},"aria-hidden":"true"}),
-              describeCron(e.value)
+              describeCron(e.value,parseOptions)
             ))
           ):null,
 
@@ -1069,7 +1855,7 @@ function App() {
               nextRuns.map((r,i)=>React.createElement("div",{key:i,style:{fontSize:11,display:"flex",alignItems:"center",gap:6,padding:"3px 0",fontFamily:"'JetBrains Mono',monospace",color:C.textDim}},
                 React.createElement("span",{style:{width:5,height:5,borderRadius:"50%",background:r.color,flexShrink:0},"aria-hidden":"true"}),
                 React.createElement("span",{style:{color:C.text}},MONTHS[r.time.getMonth()]+" "+r.time.getDate()),
-                React.createElement("span",null,String(r.time.getHours()).padStart(2,"0")+":"+String(r.time.getMinutes()).padStart(2,"0")),
+                React.createElement("span",null,formatRunTime(r.time)),
                 React.createElement("span",{style:{fontSize:9,color:C.textMuted,marginLeft:"auto"}},DAYS[r.time.getDay()])
               ))
             )
@@ -1077,6 +1863,8 @@ function App() {
 
           // Stats
           React.createElement(StatsPanel,{expressions,year,C}),
+
+          React.createElement(WhyDebugger,{expressions,debugExpressionId,setDebugExpressionId,debugTimestamp,setDebugTimestamp,C}),
 
           // Export report button
           React.createElement("button",{onClick:handleExportReport,
@@ -1091,6 +1879,16 @@ function App() {
               React.createElement("polyline",{points:"10 9 9 9 8 9"})
             ),
             copyFeedback&&copyFeedback.type==="export"?"Report Copied!":"Export Markdown Report"
+          ),
+          React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}},
+            React.createElement("button",{onClick:handleExportSvg,
+              style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:copyFeedback&&copyFeedback.type==="svg"?C.green:C.textDim,fontSize:12,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},
+              copyFeedback&&copyFeedback.type==="svg"?"SVG Saved":"Export SVG"
+            ),
+            React.createElement("button",{onClick:handleExportPng,
+              style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:copyFeedback&&copyFeedback.type==="png"?C.green:C.textDim,fontSize:12,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},
+              copyFeedback&&copyFeedback.type==="png"?"PNG Saved":"Export PNG"
+            )
           )
         )
       )

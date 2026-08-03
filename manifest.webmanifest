@@ -1,0 +1,17 @@
+{
+  "name": "CronScope",
+  "short_name": "CronScope",
+  "description": "Offline cron schedule visualizer with heatmaps, dialect parsing, and exports.",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#0a0e17",
+  "theme_color": "#1e1e2e",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 128 128'%3E%3Crect width='128' height='128' rx='20' fill='%230a0e17'/%3E%3Cpath d='M30 34h68M30 54h68M30 74h44M30 94h54' stroke='%2306b6d4' stroke-width='10' stroke-linecap='round'/%3E%3Ccircle cx='94' cy='88' r='16' fill='%23f59e0b'/%3E%3C/svg%3E",
+      "sizes": "128x128",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

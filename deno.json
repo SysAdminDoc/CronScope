@@ -1,0 +1,10 @@
+{
+  "name": "@sysadmindoc/cronscope-core",
+  "version": "0.3.0",
+  "exports": {
+    ".": "./cronscope-core.js"
+  },
+  "tasks": {
+    "test": "node tests/core.test.js"
+  }
+}

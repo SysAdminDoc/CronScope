@@ -1,0 +1,29 @@
+{
+  "name": "cronscope",
+  "version": "0.3.0",
+  "description": "Offline cron schedule visualizer and reusable cron parser.",
+  "type": "module",
+  "bin": {
+    "cronscope": "./bin/cronscope.js"
+  },
+  "files": [
+    "index.html",
+    "cronscope-core.js",
+    "bin/",
+    "manifest.webmanifest",
+    "sw.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tests/core.test.js",
+    "build": "node scripts/build.js"
+  },
+  "keywords": [
+    "cron",
+    "scheduler",
+    "heatmap",
+    "cli"
+  ],
+  "license": "MIT"
+}

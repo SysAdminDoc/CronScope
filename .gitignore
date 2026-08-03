@@ -1,6 +1,10 @@
 *.bak
 .env
 *.log
+node_modules/
+dist/
+coverage/
+.npm/
 CLAUDE.md
 
 # Markdown files local-only (except README)
