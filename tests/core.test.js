@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { getFireTimes, matchesDate, parseCron } from "../cronscope-core.js";
+import { getFireTimes, getNextFireTime, getPreviousFireTime, matchesDate, parseCron } from "../cronscope-core.js";
 
 const weekday = parseCron("0 9 * * MON-FRI");
 assert.ok(weekday);
@@ -45,5 +45,10 @@ assert.ok(steppedMinute);
 assert.equal(steppedMinute.minutes.has(5), true);
 assert.equal(steppedMinute.minutes.has(7), true);
 assert.equal(steppedMinute.minutes.has(4), false);
+
+const pivotSchedule = parseCron("0 9 * * 1-5");
+assert.equal(getNextFireTime(pivotSchedule, new Date(2026, 5, 5, 9, 0, 0)).toString(), new Date(2026, 5, 8, 9, 0, 0).toString());
+assert.equal(getPreviousFireTime(pivotSchedule, new Date(2026, 5, 8, 9, 0, 0)).toString(), new Date(2026, 5, 5, 9, 0, 0).toString());
+assert.equal(getNextFireTime(pivotSchedule, "not-a-date"), null);
 
 console.log("core parser tests passed");

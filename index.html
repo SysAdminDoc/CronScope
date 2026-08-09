@@ -51,7 +51,8 @@ const DIALECTS = {
   github: { label:"GitHub Actions", requiresQuestion:false, allowQuestion:false, dowBase:"unix", awsYear:false },
   aws: { label:"AWS EventBridge", requiresQuestion:true, allowQuestion:true, dowBase:"quartz", awsYear:true },
 };
-const DEFAULT_PARSE_OPTIONS = { dialect:"unix", fieldMode:"auto", timezone:"local", dstAware:false };
+const DST_MODES = { wall:"Wall-clock", aware:"Exact IANA (skip/duplicate)", debian:"Debian cron compatibility" };
+const DEFAULT_PARSE_OPTIONS = { dialect:"unix", fieldMode:"auto", timezone:"local", dstMode:"wall" };
 const TIMEZONE_OPTIONS = ["local","UTC","America/New_York","America/Chicago","America/Denver","America/Los_Angeles","Europe/London","Europe/Berlin","Asia/Tokyo","Australia/Sydney"];
 const PRESETS = [
   { label: "Every minute", expr: "* * * * *" },
@@ -105,6 +106,7 @@ const EC = ["#06b6d4","#f59e0b","#a78bfa","#f43f5e","#10b981","#fb923c"];
 const LOCAL_TIMEZONE = Intl.DateTimeFormat().resolvedOptions().timeZone || "local";
 const TZ_FORMATTERS = new Map();
 const ZONED_INSTANT_CACHE = new Map();
+const DEBIAN_CATCHUP_CACHE = new Map();
 
 // Replace named month/day tokens with numeric equivalents
 function resolveNamedValues(field, nameMap) {
@@ -117,6 +119,9 @@ function resolveNamedValues(field, nameMap) {
 function getParseOptions(options) {
   const merged = Object.assign({}, DEFAULT_PARSE_OPTIONS, options || {});
   if (merged.fieldMode !== "auto") merged.fieldMode = String(merged.fieldMode);
+  if (!options || options.dstMode === undefined) merged.dstMode = options && options.dstAware ? "aware" : "wall";
+  if (!DST_MODES[merged.dstMode]) merged.dstMode = "wall";
+  merged.dstAware = merged.dstMode === "aware";
   if (merged.timezone !== "local") {
     try { new Intl.DateTimeFormat("en-US", { timeZone:merged.timezone }).format(new Date()); }
     catch { merged.timezone = "local"; }
@@ -362,7 +367,7 @@ function parseCron(expr, options) {
     domWild:domField.wildcard || domField.noSpecific,
     dowWild:dowField.wildcard || dowField.noSpecific,
     hasSeconds:layout.hasSeconds, hasYear:layout.hasYear,
-    fieldCount:parts.length, fieldMode:String(opts.fieldMode), dialect:opts.dialect, timezone:opts.timezone, dstAware:opts.dstAware,
+    fieldCount:parts.length, fieldMode:String(opts.fieldMode), dialect:opts.dialect, timezone:opts.timezone, dstMode:opts.dstMode, dstAware:opts.dstAware,
     dailyCandidates:seconds.size * minutes.size * hours.size,
     raw:cleaned,
   };
@@ -483,6 +488,32 @@ function findZonedInstants(year, monthIndex, day, hour, minute, second, timezone
   return matches;
 }
 
+function findDebianCatchupInstant(year, monthIndex, day, hour, minute, second, timezone) {
+  const key = [timezone, year, monthIndex, day, hour, minute, second].join("|");
+  if (DEBIAN_CATCHUP_CACHE.has(key)) return DEBIAN_CATCHUP_CACHE.get(key);
+  const targetWall = Date.UTC(year, monthIndex, day, hour, minute, 0);
+  const approx = Date.UTC(year, monthIndex, day, hour, minute, second);
+  const sixHours = 6 * 60 * 60 * 1000;
+  for (let ts = approx - sixHours; ts <= approx + sixHours; ts += 60 * 1000) {
+    const parts = getTZParts(ts, timezone);
+    if (parts.year !== year || parts.month !== monthIndex + 1 || parts.day !== day || parts.second !== 0) continue;
+    const wallMinute = Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, 0);
+    if (wallMinute < targetWall) continue;
+    const candidate = ts + second * 1000;
+    const candidateParts = getTZParts(candidate, timezone);
+    if (candidateParts.year === year && candidateParts.month === monthIndex + 1 && candidateParts.day === day && candidateParts.second === second) {
+      DEBIAN_CATCHUP_CACHE.set(key, candidate);
+      return candidate;
+    }
+  }
+  DEBIAN_CATCHUP_CACHE.set(key, null);
+  return null;
+}
+
+function isDebianSpecificSchedule(parsed) {
+  return parsed.minutes.size === 1 && parsed.hours.size === 1 && parsed.seconds.size === 1;
+}
+
 function createDisplayDate(instant, year, monthIndex, day, hour, minute, second, duplicated) {
   const date = new Date(instant);
   const dow = new Date(year, monthIndex, day).getDay();
@@ -499,9 +530,20 @@ function createDisplayDate(instant, year, monthIndex, day, hour, minute, second,
 
 function makeFireDates(parsed, year, monthIndex, day, hour, minute, second) {
   const timezone = parsed.timezone || "local";
-  if (timezone === "local" || timezone === LOCAL_TIMEZONE) return [new Date(year, monthIndex, day, hour, minute, second)];
-  const instants = findZonedInstants(year, monthIndex, day, hour, minute, second, timezone);
-  if (parsed.dstAware) {
+  const mode = parsed.dstMode || (parsed.dstAware ? "aware" : "wall");
+  if (mode === "wall" && (timezone === "local" || timezone === LOCAL_TIMEZONE)) return [new Date(year, monthIndex, day, hour, minute, second)];
+  const zone = timezone === "local" ? LOCAL_TIMEZONE : timezone;
+  const instants = findZonedInstants(year, monthIndex, day, hour, minute, second, zone);
+  if (mode === "debian") {
+    if (instants.length > 0) {
+      if (isDebianSpecificSchedule(parsed)) return [createDisplayDate(instants[0], year, monthIndex, day, hour, minute, second, false)];
+      return instants.map((ts, i) => createDisplayDate(ts, year, monthIndex, day, hour, minute, second, i > 0));
+    }
+    if (!isDebianSpecificSchedule(parsed)) return [];
+    const catchup = findDebianCatchupInstant(year, monthIndex, day, hour, minute, second, zone);
+    return catchup === null ? [] : [createDisplayDate(catchup, year, monthIndex, day, hour, minute, second, false)];
+  }
+  if (mode === "aware") {
     return instants.map((ts, i) => createDisplayDate(ts, year, monthIndex, day, hour, minute, second, instants.length > 1 && i > 0));
   }
   // Wall-clock mode keeps one nominal run for ambiguous/missing DST times;
@@ -532,7 +574,7 @@ let fireTimeWorkerRequestId = 0;
 const fireTimeWorkerPending = new Map();
 
 function parsedCacheBaseKey(parsed, year) {
-  return [parsed.raw, parsed.dialect, parsed.timezone, parsed.dstAware ? "dst" : "wall", year].join("|");
+  return [parsed.raw, parsed.dialect, parsed.timezone, parsed.dstMode || (parsed.dstAware ? "aware" : "wall"), year].join("|");
 }
 
 function parsedCacheKey(parsed, year, maxResults) {
@@ -578,7 +620,7 @@ function warmFireTimesInWorker(expressions, year) {
   const schedules = expressions.filter(expression => {
     const parsed = expression.parsed;
     const timezone = parsed && (parsed.timezone || "local");
-    return parsed && (timezone === "local" || timezone === LOCAL_TIMEZONE);
+    return parsed && (parsed.dstMode || "wall") === "wall" && (timezone === "local" || timezone === LOCAL_TIMEZONE);
   }).map(expression => {
     parsedById.set(String(expression.id), expression.parsed);
     return {
@@ -1237,7 +1279,7 @@ function encodeAppState(expressions, year, options) {
   if (opts.dialect !== DEFAULT_PARSE_OPTIONS.dialect) params.set("dialect", opts.dialect);
   if (opts.fieldMode !== DEFAULT_PARSE_OPTIONS.fieldMode) params.set("mode", opts.fieldMode);
   if (opts.timezone !== DEFAULT_PARSE_OPTIONS.timezone) params.set("tz", opts.timezone);
-  if (opts.dstAware) params.set("dst", "1");
+  if (opts.dstMode !== DEFAULT_PARSE_OPTIONS.dstMode) params.set("dst", opts.dstMode);
   return params.toString();
 }
 
@@ -1257,8 +1299,9 @@ function decodeURLState() {
   const dialect = DIALECTS[params.get("dialect")] ? params.get("dialect") : DEFAULT_PARSE_OPTIONS.dialect;
   const mode = FIELD_MODE_LABELS[params.get("mode")] ? params.get("mode") : DEFAULT_PARSE_OPTIONS.fieldMode;
   const timezone = params.get("tz") || DEFAULT_PARSE_OPTIONS.timezone;
-  const dstAware = params.get("dst") === "1";
-  return { exprs: exprs.length > 0 ? exprs : null, year: year && !isNaN(year) ? year : null, dialect, mode, timezone, dstAware };
+  const dstParam = params.get("dst");
+  const dstMode = DST_MODES[dstParam] ? dstParam : dstParam === "1" ? "aware" : DEFAULT_PARSE_OPTIONS.dstMode;
+  return { exprs: exprs.length > 0 ? exprs : null, year: year && !isNaN(year) ? year : null, dialect, mode, timezone, dstMode };
 }
 
 // --- localStorage schedule sets ---
@@ -1618,7 +1661,7 @@ function WhyDebugger({expressions,debugExpressionId,setDebugExpressionId,debugTi
 function App() {
   // Load initial state from URL or defaults
   const urlState = useMemo(() => decodeURLState(), []);
-  const initialOptions = { dialect:urlState.dialect, fieldMode:urlState.mode, timezone:urlState.timezone, dstAware:urlState.dstAware };
+  const initialOptions = { dialect:urlState.dialect, fieldMode:urlState.mode, timezone:urlState.timezone, dstMode:urlState.dstMode };
   const initialExprs = urlState.exprs
     ? urlState.exprs.map((e, i) => ({ id: i + 1, value: e.value, label: e.label, parsed: parseCron(e.value, initialOptions) }))
     : [{ id: 1, value: "0 9 * * 1-5", label: "Weekday morning", parsed: parseCron("0 9 * * 1-5", initialOptions) }];
@@ -1629,7 +1672,7 @@ function App() {
   const [dialect, setDialect] = useState(urlState.dialect);
   const [fieldMode, setFieldMode] = useState(urlState.mode);
   const [timezone, setTimezone] = useState(urlState.timezone);
-  const [dstAware, setDstAware] = useState(urlState.dstAware);
+  const [dstMode, setDstMode] = useState(urlState.dstMode);
   const [zoomMode, setZoomMode] = useState("year");
   const [selectedMonth, setSelectedMonth] = useState(new Date().getMonth());
   const [selectedDay, setSelectedDay] = useState(new Date().getDate());
@@ -1650,7 +1693,7 @@ function App() {
   const [debugExpressionId, setDebugExpressionId] = useState("");
   const nextId = useRef(initialExprs.length + 1);
   const C = THEMES[theme];
-  const parseOptions = useMemo(()=>({ dialect, fieldMode, timezone, dstAware }),[dialect,fieldMode,timezone,dstAware]);
+  const parseOptions = useMemo(()=>({ dialect, fieldMode, timezone, dstMode }),[dialect,fieldMode,timezone,dstMode]);
   const workerInputKey = expressions.map(e => e.id + "|" + e.value + "|" + (e.parsed ? e.parsed.raw : "invalid")).join("||");
   const presetsDialogRef = useModalFocus(showPresets, () => { setShowPresets(false); setActivePresetTarget(null); });
   const importDialogRef = useModalFocus(showImport, () => { setShowImport(false); setImportText(""); });
@@ -1730,7 +1773,7 @@ function App() {
       if (DIALECTS[set.options.dialect]) setDialect(set.options.dialect);
       if (FIELD_MODE_LABELS[set.options.fieldMode]) setFieldMode(set.options.fieldMode);
       if (set.options.timezone) setTimezone(set.options.timezone);
-      setDstAware(!!set.options.dstAware);
+      setDstMode(set.options.dstMode || (set.options.dstAware ? "aware" : "wall"));
     }
     nextId.current = 1;
     const opts = set.options || parseOptions;
@@ -1891,9 +1934,11 @@ function App() {
             "Timezone",
             React.createElement("input",{value:timezone,onChange:ev=>setTimezone(ev.target.value),list:"timezone-options",placeholder:"IANA timezone",style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:12}})
           ),
-          React.createElement("label",{style:{display:"flex",gap:8,alignItems:"center",fontSize:12,color:C.textDim,padding:"8px 0"}},
-            React.createElement("input",{type:"checkbox",checked:dstAware,onChange:ev=>setDstAware(ev.target.checked)}),
-            "DST-aware rendering"
+          React.createElement("label",{style:{display:"flex",flexDirection:"column",gap:4,fontSize:10,color:C.textMuted,textTransform:"uppercase",letterSpacing:"0.05em"}},
+            "DST behavior",
+            React.createElement("select",{value:dstMode,onChange:ev=>setDstMode(ev.target.value),style:{background:C.surface,border:"1px solid "+C.border,borderRadius:8,padding:"7px 8px",color:C.text,fontSize:12}},
+              Object.entries(DST_MODES).map(([key,label])=>React.createElement("option",{key:key,value:key},label))
+            )
           ),
           React.createElement("datalist",{id:"timezone-options"},
             TIMEZONE_OPTIONS.map(tz=>React.createElement("option",{key:tz,value:tz}))

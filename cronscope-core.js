@@ -289,6 +289,58 @@ export function matchesDate(parsed, year, month, day) {
   return dialect(parsed.dialect).requiresQuestion ? dom && dow : dom || dow;
 }
 
+function normalizePivot(pivot) {
+  const date = pivot instanceof Date ? new Date(pivot.getTime()) : new Date(pivot);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function adjacentFireTime(parsed, pivot, direction, maxYears = 50) {
+  const point = normalizePivot(pivot);
+  const span = Number.isInteger(maxYears) && maxYears >= 0 ? maxYears : 50;
+  if (!parsed || !point || (direction !== 1 && direction !== -1)) return null;
+
+  const step = direction;
+  const months = [...parsed.months].sort((a, b) => direction > 0 ? a - b : b - a);
+  const hours = [...parsed.hours].sort((a, b) => direction > 0 ? a - b : b - a);
+  const minutes = [...parsed.minutes].sort((a, b) => direction > 0 ? a - b : b - a);
+  const seconds = [...parsed.seconds].sort((a, b) => direction > 0 ? a - b : b - a);
+
+  for (let offset = 0; offset <= span; offset++) {
+    const year = point.getFullYear() + offset * step;
+    if (parsed.years && !parsed.years.has(year)) continue;
+    for (const month of months) {
+      const days = [];
+      for (let day = 1; day <= lastDay(year, month); day++) {
+        if (matchesDate(parsed, year, month, day)) days.push(day);
+      }
+      if (direction < 0) days.reverse();
+      for (const day of days) {
+        for (const hour of hours) {
+          for (const minute of minutes) {
+            for (const second of seconds) {
+              const candidate = new Date(year, month - 1, day, hour, minute, second);
+              if (direction > 0 ? candidate > point : candidate < point) return candidate;
+            }
+          }
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function findAdjacentFireTime(parsed, pivot, direction, maxYears = 50) {
+  return adjacentFireTime(parsed, pivot, direction, maxYears);
+}
+
+export function getNextFireTime(parsed, pivot = new Date(), maxYears = 50) {
+  return adjacentFireTime(parsed, pivot, 1, maxYears);
+}
+
+export function getPreviousFireTime(parsed, pivot = new Date(), maxYears = 50) {
+  return adjacentFireTime(parsed, pivot, -1, maxYears);
+}
+
 export function getFireTimes(parsed, year, maxResults = 5000) {
   if (!parsed || (parsed.years && !parsed.years.has(year))) return [];
   const results = [];
