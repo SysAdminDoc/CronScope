@@ -2,7 +2,7 @@
   "name": "cronscope-hover",
   "displayName": "CronScope Hover",
   "description": "Preview cron schedules as a calendar heatmap while editing.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "publisher": "sysadmindoc",
   "license": "MIT",
   "engines": {

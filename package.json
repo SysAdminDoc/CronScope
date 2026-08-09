@@ -1,6 +1,6 @@
 {
   "name": "cronscope",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Offline cron schedule visualizer and reusable cron parser.",
   "type": "module",
   "bin": {

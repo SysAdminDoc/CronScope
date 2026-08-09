@@ -2,7 +2,7 @@
 
 All notable changes to CronScope will be documented in this file.
 
-## [Unreleased]
+## [v0.3.1] - 2026-08-09
 
 - Added arrow-key navigation for heatmap cells and focus trapping for dialogs.
 - Improved Kubernetes CronJob YAML drag-and-drop parsing, including quoted Quartz expressions.

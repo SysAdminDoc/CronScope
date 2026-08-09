@@ -1,6 +1,6 @@
 # CronScope
 
-![Version](https://img.shields.io/badge/version-0.2.0-blue)
+![Version](https://img.shields.io/badge/version-0.3.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Any%20Browser-orange)
 ![JavaScript](https://img.shields.io/badge/JavaScript-React%2018-61DAFB?logo=react&logoColor=white)
@@ -55,6 +55,8 @@ cd CronScope
 | Crontab Import | Paste a raw crontab file, each line becomes an expression |
 | Export Report | Copy a full Markdown analysis report to clipboard |
 | Copy as Markdown | One-click copy of plain-English translations |
+| Background Compute | Uses a bounded Web Worker for local-time fire-time generation, with a synchronous fallback |
+| VS Code Hover Extension | Preview a cron description and year heatmap while hovering a cron expression |
 | Zero Config | No build step, no dependencies, no server — one HTML file |
 
 ## Usage
