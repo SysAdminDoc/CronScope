@@ -1,0 +1,19 @@
+{
+  "name": "cronscope-hover",
+  "displayName": "CronScope Hover",
+  "description": "Preview cron schedules as a calendar heatmap while editing.",
+  "version": "0.3.0",
+  "publisher": "sysadmindoc",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "type": "module",
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "categories": [
+    "Other"
+  ]
+}

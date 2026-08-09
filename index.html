@@ -116,6 +116,7 @@ function resolveNamedValues(field, nameMap) {
 
 function getParseOptions(options) {
   const merged = Object.assign({}, DEFAULT_PARSE_OPTIONS, options || {});
+  if (merged.fieldMode !== "auto") merged.fieldMode = String(merged.fieldMode);
   if (merged.timezone !== "local") {
     try { new Intl.DateTimeFormat("en-US", { timeZone:merged.timezone }).format(new Date()); }
     catch { merged.timezone = "local"; }
@@ -140,8 +141,9 @@ function expandAliasExpression(raw, options) {
   const alias = CRON_ALIASES[raw.toLowerCase()];
   if (!alias) return null;
   const opts = getParseOptions(options);
-  if (opts.fieldMode === "6") return getDialectConfig(opts.dialect).awsYear ? alias + " *" : "0 " + alias;
-  if (opts.fieldMode === "7") return "0 " + alias + " *";
+  const mode = String(opts.fieldMode);
+  if (mode === "6") return getDialectConfig(opts.dialect).awsYear ? alias.split(/\s+/).slice(0,4).concat("?").join(" ") + " *" : "0 " + alias;
+  if (mode === "7") return "0 " + alias + " *";
   return alias;
 }
 
@@ -161,7 +163,9 @@ function parseCronField(field, min, max, nameMap) {
   for (const part of field.split(",")) {
     if (part === "*") { for (let i = min; i <= max; i++) values.add(i); }
     else if (part.includes("/")) {
-      const [range, stepStr] = part.split("/");
+      const slashParts = part.split("/");
+      if (slashParts.length > 2) return null;
+      const [range, stepStr] = slashParts;
       const step = parseInt(stepStr, 10);
       if (isNaN(step) || step <= 0) return null;
       let start = min, end = max;
@@ -246,7 +250,9 @@ function addDowRange(values, start, end, step) {
 
 function parseDowSimplePart(part, options) {
   const values = new Set();
-  const [rangePart, stepPart] = part.split("/");
+  const slashParts = part.split("/");
+  if (slashParts.length > 2) return null;
+  const [rangePart, stepPart] = slashParts;
   const step = stepPart === undefined ? 1 : parseInt(stepPart, 10);
   if (isNaN(step) || step <= 0) return null;
   if (rangePart === "*") {
@@ -263,7 +269,8 @@ function parseDowSimplePart(part, options) {
   }
   const one = parseDowNumber(rangePart, options);
   if (one === null) return null;
-  values.add(one);
+  if (stepPart === undefined) values.add(one);
+  else addDowRange(values, one, 6, step);
   return values;
 }
 
@@ -307,11 +314,12 @@ function parseDayOfWeekField(field, options) {
 function determineCronLayout(parts, options) {
   const opts = getParseOptions(options);
   const dialect = getDialectConfig(opts.dialect);
-  if (opts.fieldMode !== "auto") {
-    if (parts.length !== Number(opts.fieldMode)) return null;
-    if (opts.fieldMode === "5") return { hasSeconds:false, hasYear:false, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:null };
-    if (opts.fieldMode === "6" && dialect.awsYear) return { hasSeconds:false, hasYear:true, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:5 };
-    if (opts.fieldMode === "6") return { hasSeconds:true, hasYear:false, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:null };
+  const mode = String(opts.fieldMode);
+  if (mode !== "auto") {
+    if (parts.length !== Number(mode)) return null;
+    if (mode === "5") return { hasSeconds:false, hasYear:false, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:null };
+    if (mode === "6" && dialect.awsYear) return { hasSeconds:false, hasYear:true, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:5 };
+    if (mode === "6") return { hasSeconds:true, hasYear:false, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:null };
     return { hasSeconds:true, hasYear:true, second:0, minute:1, hour:2, dom:3, month:4, dow:5, year:6 };
   }
   if (parts.length === 5) return { hasSeconds:false, hasYear:false, second:null, minute:0, hour:1, dom:2, month:3, dow:4, year:null };
@@ -346,7 +354,7 @@ function parseCron(expr, options) {
   const dialect = getDialectConfig(opts.dialect);
   const domRestricted = !domField.wildcard && !domField.noSpecific;
   const dowRestricted = !dowField.wildcard && !dowField.noSpecific;
-  if (dialect.requiresQuestion && ((domRestricted && dowRestricted) || (domField.noSpecific && dowField.noSpecific))) return null;
+  if (dialect.requiresQuestion && (domField.noSpecific === dowField.noSpecific)) return null;
   if (!dialect.allowQuestion && (domField.noSpecific || dowField.noSpecific)) return null;
   return {
     seconds, minutes, hours, months, years,
@@ -354,7 +362,7 @@ function parseCron(expr, options) {
     domWild:domField.wildcard || domField.noSpecific,
     dowWild:dowField.wildcard || dowField.noSpecific,
     hasSeconds:layout.hasSeconds, hasYear:layout.hasYear,
-    fieldCount:parts.length, dialect:opts.dialect, timezone:opts.timezone, dstAware:opts.dstAware,
+    fieldCount:parts.length, fieldMode:String(opts.fieldMode), dialect:opts.dialect, timezone:opts.timezone, dstAware:opts.dstAware,
     dailyCandidates:seconds.size * minutes.size * hours.size,
     raw:cleaned,
   };
@@ -460,10 +468,17 @@ function findZonedInstants(year, monthIndex, day, hour, minute, second, timezone
   if (ZONED_INSTANT_CACHE.has(key)) return ZONED_INSTANT_CACHE.get(key);
   const approx = Date.UTC(year, monthIndex, day, hour, minute, second);
   const matches = [];
-  for (let ts = approx - 14 * 3600000; ts <= approx + 14 * 3600000; ts += 60000) {
-    const p = getTZParts(ts, timezone);
-    if (p.year === year && p.month === monthIndex + 1 && p.day === day && p.hour === hour && p.minute === minute && p.second === second) matches.push(ts);
+  const offsets = new Set();
+  for (const sample of [approx - 24 * 3600000, approx, approx + 24 * 3600000]) {
+    const p = getTZParts(sample, timezone);
+    offsets.add(Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - sample);
   }
+  for (const offset of offsets) {
+    const ts = approx - offset;
+    const p = getTZParts(ts, timezone);
+    if (p.year === year && p.month === monthIndex + 1 && p.day === day && p.hour === hour && p.minute === minute && p.second === second && !matches.includes(ts)) matches.push(ts);
+  }
+  matches.sort((a,b) => a - b);
   ZONED_INSTANT_CACHE.set(key, matches);
   return matches;
 }
@@ -485,10 +500,13 @@ function createDisplayDate(instant, year, monthIndex, day, hour, minute, second,
 function makeFireDates(parsed, year, monthIndex, day, hour, minute, second) {
   const timezone = parsed.timezone || "local";
   if (timezone === "local" || timezone === LOCAL_TIMEZONE) return [new Date(year, monthIndex, day, hour, minute, second)];
-  if (parsed.dstAware && parsed.dailyCandidates <= 240) {
-    const instants = findZonedInstants(year, monthIndex, day, hour, minute, second, timezone);
+  const instants = findZonedInstants(year, monthIndex, day, hour, minute, second, timezone);
+  if (parsed.dstAware) {
     return instants.map((ts, i) => createDisplayDate(ts, year, monthIndex, day, hour, minute, second, instants.length > 1 && i > 0));
   }
+  // Wall-clock mode keeps one nominal run for ambiguous/missing DST times;
+  // valid times still carry their real instant so next-run ordering is correct.
+  if (instants.length > 0) return [createDisplayDate(instants[0], year, monthIndex, day, hour, minute, second, false)];
   return [createDisplayDate(Date.UTC(year, monthIndex, day, hour, minute, second), year, monthIndex, day, hour, minute, second, false)];
 }
 
@@ -509,6 +527,9 @@ function estimateFireCount(parsed, year) {
 const FIRE_COUNT_CAP = 500000;
 const FIRE_TIME_CACHE = new Map();
 const FIRE_DATA_CACHE = new Map();
+let fireTimeWorker = null;
+let fireTimeWorkerRequestId = 0;
+const fireTimeWorkerPending = new Map();
 
 function parsedCacheBaseKey(parsed, year) {
   return [parsed.raw, parsed.dialect, parsed.timezone, parsed.dstAware ? "dst" : "wall", year].join("|");
@@ -516,6 +537,68 @@ function parsedCacheBaseKey(parsed, year) {
 
 function parsedCacheKey(parsed, year, maxResults) {
   return parsedCacheBaseKey(parsed, year) + "|" + maxResults;
+}
+
+function getFireTimeWorker() {
+  if (fireTimeWorker) return fireTimeWorker;
+  if (typeof Worker === "undefined" || typeof window === "undefined" || !/^https?:$/.test(window.location.protocol)) return null;
+  try {
+    fireTimeWorker = new Worker("./fire-time-worker.js", { type:"module" });
+    fireTimeWorker.onmessage = event => {
+      const request = fireTimeWorkerPending.get(event.data?.requestId);
+      if (!request) return;
+      fireTimeWorkerPending.delete(event.data.requestId);
+      const parsedById = request.parsedById;
+      (event.data.results || []).forEach(result => {
+        const parsed = parsedById.get(String(result.id));
+        if (!parsed || !result.valid) return;
+        const baseKey = parsedCacheBaseKey(parsed, request.year);
+        FIRE_TIME_CACHE.set(parsedCacheKey(parsed, request.year, 5000), (result.times || []).map(timestamp => new Date(timestamp)));
+        for (const key of FIRE_DATA_CACHE.keys()) if (key.startsWith(baseKey + "|")) FIRE_DATA_CACHE.delete(key);
+      });
+      request.resolve(true);
+    };
+    fireTimeWorker.onerror = () => {
+      fireTimeWorkerPending.forEach(request => request.resolve(false));
+      fireTimeWorkerPending.clear();
+      fireTimeWorker.terminate();
+      fireTimeWorker = null;
+    };
+    return fireTimeWorker;
+  } catch {
+    fireTimeWorker = null;
+    return null;
+  }
+}
+
+function warmFireTimesInWorker(expressions, year) {
+  const worker = getFireTimeWorker();
+  if (!worker) return Promise.resolve(false);
+  const parsedById = new Map();
+  const schedules = expressions.filter(expression => {
+    const parsed = expression.parsed;
+    const timezone = parsed && (parsed.timezone || "local");
+    return parsed && (timezone === "local" || timezone === LOCAL_TIMEZONE);
+  }).map(expression => {
+    parsedById.set(String(expression.id), expression.parsed);
+    return {
+      id: expression.id,
+      expression: expression.parsed.raw,
+      dialect: expression.parsed.dialect,
+      fieldMode: expression.parsed.fieldMode || "auto",
+    };
+  });
+  if (schedules.length === 0) return Promise.resolve(false);
+  const requestId = ++fireTimeWorkerRequestId;
+  return new Promise(resolve => {
+    fireTimeWorkerPending.set(requestId, { parsedById, year, resolve });
+    try {
+      worker.postMessage({ requestId, year, maxResults:5000, schedules });
+    } catch {
+      fireTimeWorkerPending.delete(requestId);
+      resolve(false);
+    }
+  });
 }
 
 function getFireTimes(parsed, year, maxResults = 5000) {
@@ -1568,6 +1651,7 @@ function App() {
   const nextId = useRef(initialExprs.length + 1);
   const C = THEMES[theme];
   const parseOptions = useMemo(()=>({ dialect, fieldMode, timezone, dstAware }),[dialect,fieldMode,timezone,dstAware]);
+  const workerInputKey = expressions.map(e => e.id + "|" + e.value + "|" + (e.parsed ? e.parsed.raw : "invalid")).join("||");
   const presetsDialogRef = useModalFocus(showPresets, () => { setShowPresets(false); setActivePresetTarget(null); });
   const importDialogRef = useModalFocus(showImport, () => { setShowImport(false); setImportText(""); });
   const setsDialogRef = useModalFocus(showSets, () => setShowSets(false));
@@ -1599,6 +1683,14 @@ function App() {
       navigator.serviceWorker.register("./sw.js").catch(()=>{});
     }
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    warmFireTimesInWorker(expressions, year).then(warmed => {
+      if (active && warmed) setExpressions(prev => prev.map(expression => ({ ...expression })));
+    });
+    return () => { active = false; };
+  }, [workerInputKey, year, parseOptions]);
 
   const updateExpr=useCallback((id,value)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,value,parsed:parseCron(value,parseOptions)}:e));},[parseOptions]);
   const updateLabel=useCallback((id,label)=>{setExpressions(prev=>prev.map(e=>e.id===id?{...e,label}:e));},[]);

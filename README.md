@@ -21,6 +21,11 @@ Every cron tool out there shows you the next 5 runs in a plain text list. That's
 2. Open in any browser
 3. Start typing cron expressions
 
+For development, run `npm test` for parser, import, timezone, worker, and
+extension checks, then `npm run build` to create the `dist/` bundle. The VS
+Code hover extension lives in `vscode-extension/`; run
+`npm run build:extension` before packaging it with VS Code extension tooling.
+
 No server. No install. No dependencies. Just a single HTML file.
 
 ```bash

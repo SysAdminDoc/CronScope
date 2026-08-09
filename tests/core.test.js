@@ -27,4 +27,23 @@ const aws = parseCron("cron(0 9 ? * MON *)", { dialect:"aws" });
 assert.ok(aws);
 assert.equal(matchesDate(aws, 2026, 6, 1), true);
 
+const numericMode = parseCron("30 0 9 * * MON-FRI", { fieldMode:6 });
+assert.ok(numericMode);
+assert.equal(numericMode.hasSeconds, true);
+assert.equal(numericMode.fieldMode, "6");
+
+const awsAlias = parseCron("@daily", { dialect:"aws", fieldMode:"6" });
+assert.ok(awsAlias);
+assert.equal(awsAlias.hasSeconds, false);
+assert.equal(awsAlias.hasYear, true);
+
+assert.equal(parseCron("0 0 0 * * *", { dialect:"quartz", fieldMode:"6" }), null);
+assert.ok(parseCron("0 0 0 ? * MON", { dialect:"quartz", fieldMode:"6" }));
+
+const steppedMinute = parseCron("5/2 * * * *");
+assert.ok(steppedMinute);
+assert.equal(steppedMinute.minutes.has(5), true);
+assert.equal(steppedMinute.minutes.has(7), true);
+assert.equal(steppedMinute.minutes.has(4), false);
+
 console.log("core parser tests passed");

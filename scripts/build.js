@@ -13,5 +13,8 @@ await copyFile(join(root, "index.html"), join(dist, "index.html"));
 await copyFile(join(root, "manifest.webmanifest"), join(dist, "manifest.webmanifest"));
 await copyFile(join(root, "sw.js"), join(dist, "sw.js"));
 await copyFile(join(root, "cronscope-core.js"), join(dist, "cronscope-core.js"));
+await copyFile(join(root, "fire-time-worker.js"), join(dist, "fire-time-worker.js"));
+await mkdir(join(root, "vscode-extension"), { recursive:true });
+await copyFile(join(root, "cronscope-core.js"), join(root, "vscode-extension", "core.js"));
 
 console.log("Built dist/cronscope.html");

@@ -3,7 +3,8 @@ const ASSETS = [
   "./",
   "./index.html",
   "./cronscope-core.js",
-  "./manifest.webmanifest"
+  "./manifest.webmanifest",
+  "./fire-time-worker.js"
 ];
 
 self.addEventListener("install", event => {

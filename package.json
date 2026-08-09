@@ -9,6 +9,7 @@
   "files": [
     "index.html",
     "cronscope-core.js",
+    "fire-time-worker.js",
     "bin/",
     "manifest.webmanifest",
     "sw.js",
@@ -17,7 +18,8 @@
   ],
   "scripts": {
     "test": "node --test tests/*.test.js",
-    "build": "node scripts/build.js"
+    "build": "node scripts/build.js",
+    "build:extension": "node scripts/build-extension.js"
   },
   "keywords": [
     "cron",
