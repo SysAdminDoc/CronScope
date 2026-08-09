@@ -93,7 +93,7 @@ async function main() {
     return;
   }
   if (cli.version) {
-    console.log("CronScope " + (process.env.npm_package_version || "0.3.1"));
+    console.log("CronScope " + (process.env.npm_package_version || "0.4.0"));
     return;
   }
 
@@ -107,6 +107,7 @@ async function main() {
   };
   let schedules;
   if (cli.file || cli.stdin || cli.expressions.length === 0) {
+    if (!cli.file && !cli.stdin && cli.expressions.length === 0 && process.stdin.isTTY) throw new Error("No input was provided. Use a quoted expression, --file, or --stdin.\n\n" + USAGE);
     const text = cli.file ? await readFile(resolve(cli.file), "utf8") : await readStdin();
     const imported = parseCrontab(text, parserOptions);
     if (imported.length > 0) schedules = imported;

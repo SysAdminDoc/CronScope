@@ -2,6 +2,13 @@
 
 All notable changes to CronScope will be documented in this file.
 
+## [v0.4.0] - 2026-08-09
+
+- Added Debian-compatible DST handling alongside wall-clock and exact-IANA modes.
+- Added bounded previous/next fire-time queries from arbitrary pivot timestamps.
+- Added a dependency-free CLI pipeline for crontab stdin/files, JSON/TUI output, and standalone HTML reports.
+- Added regression coverage for DST transitions, CLI imports, pivot queries, and embedded report state.
+
 ## [v0.3.1] - 2026-08-09
 
 - Added arrow-key navigation for heatmap cells and focus trapping for dialogs.

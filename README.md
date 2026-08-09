@@ -1,6 +1,6 @@
 # CronScope
 
-![Version](https://img.shields.io/badge/version-0.3.1-blue)
+![Version](https://img.shields.io/badge/version-0.4.0-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Platform](https://img.shields.io/badge/platform-Any%20Browser-orange)
 ![JavaScript](https://img.shields.io/badge/JavaScript-React%2018-61DAFB?logo=react&logoColor=white)
@@ -25,6 +25,19 @@ For development, run `npm test` for parser, import, timezone, worker, and
 extension checks, then `npm run build` to create the `dist/` bundle. The VS
 Code hover extension lives in `vscode-extension/`; run
 `npm run build:extension` before packaging it with VS Code extension tooling.
+
+The reusable CLI accepts one expression or a complete crontab. It can read
+stdin, `/etc/cron.d`-style username fields, or a file, and can emit a terminal
+dashboard, JSON, or a standalone browser artifact:
+
+```bash
+node bin/cronscope.js "0 9 * * 1-5" --year=2026 --pivot=2026-06-05T09:00:00
+cat crontab.txt | node bin/cronscope.js --stdin --format=json
+node bin/cronscope.js --file=crontab.txt --output=cron-report.html
+```
+
+Use `--tui` for a terminal validation view and `--pivot=ISO` to show the
+previous and next occurrence around an arbitrary timestamp.
 
 No server. No install. No dependencies. Just a single HTML file.
 
@@ -55,7 +68,9 @@ cd CronScope
 | Crontab Import | Paste a raw crontab file, each line becomes an expression |
 | Export Report | Copy a full Markdown analysis report to clipboard |
 | Copy as Markdown | One-click copy of plain-English translations |
+| DST Compatibility | Choose wall-clock, exact IANA, or Debian cron skip/repeat behavior |
 | Background Compute | Uses a bounded Web Worker for local-time fire-time generation, with a synchronous fallback |
+| CLI Pipeline | Read crontabs from stdin/files and emit terminal, JSON, or shareable HTML output |
 | VS Code Hover Extension | Preview a cron description and year heatmap while hovering a cron expression |
 | Zero Config | No build step, no dependencies, no server — one HTML file |
 
@@ -140,7 +155,6 @@ All computation happens client-side in the browser. No data leaves your machine.
 - Work entirely offline after loading
 
 **Doesn't:**
-- Support non-standard 6-field (seconds) or 7-field (years) cron
 - Execute or schedule actual jobs
 - Send any data anywhere — fully client-side
 

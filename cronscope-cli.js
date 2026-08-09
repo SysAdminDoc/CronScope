@@ -1,6 +1,6 @@
 import { asciiHeatmap, describeCron, getFireTimes, getNextFireTime, getPreviousFireTime, parseCron } from "./cronscope-core.js";
 
-export const CLI_VERSION = "0.3.1";
+export const CLI_VERSION = "0.4.0";
 export const DEFAULT_SAMPLE_LIMIT = 20000;
 
 function commandLabel(command, fallback) {
@@ -136,4 +136,3 @@ export function buildEmbeddedHtml(template, state) {
   const json = JSON.stringify(state).replace(/</g, "\\u003c").replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029");
   return template.replace(marker, `const EMBEDDED_APP_STATE = ${json};`);
 }
-
