@@ -53,6 +53,7 @@ const DIALECTS = {
 };
 const DST_MODES = { wall:"Wall-clock", aware:"Exact IANA (skip/duplicate)", debian:"Debian cron compatibility" };
 const DEFAULT_PARSE_OPTIONS = { dialect:"unix", fieldMode:"auto", timezone:"local", dstMode:"wall" };
+const EMBEDDED_APP_STATE = null;
 const TIMEZONE_OPTIONS = ["local","UTC","America/New_York","America/Chicago","America/Denver","America/Los_Angeles","Europe/London","Europe/Berlin","Asia/Tokyo","Australia/Sydney"];
 const PRESETS = [
   { label: "Every minute", expr: "* * * * *" },
@@ -1284,6 +1285,16 @@ function encodeAppState(expressions, year, options) {
 }
 
 function decodeURLState() {
+  if (!window.location.search && EMBEDDED_APP_STATE) {
+    return {
+      exprs: EMBEDDED_APP_STATE.exprs || null,
+      year: EMBEDDED_APP_STATE.year || null,
+      dialect: DIALECTS[EMBEDDED_APP_STATE.dialect] ? EMBEDDED_APP_STATE.dialect : DEFAULT_PARSE_OPTIONS.dialect,
+      mode: FIELD_MODE_LABELS[EMBEDDED_APP_STATE.mode] ? EMBEDDED_APP_STATE.mode : DEFAULT_PARSE_OPTIONS.fieldMode,
+      timezone: EMBEDDED_APP_STATE.timezone || DEFAULT_PARSE_OPTIONS.timezone,
+      dstMode: DST_MODES[EMBEDDED_APP_STATE.dstMode] ? EMBEDDED_APP_STATE.dstMode : DEFAULT_PARSE_OPTIONS.dstMode,
+    };
+  }
   const params = new URLSearchParams(window.location.search);
   const exprs = [];
   // Check expr, expr1, expr2, ... up to 20

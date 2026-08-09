@@ -9,6 +9,7 @@
   "files": [
     "index.html",
     "cronscope-core.js",
+    "cronscope-cli.js",
     "fire-time-worker.js",
     "bin/",
     "manifest.webmanifest",
