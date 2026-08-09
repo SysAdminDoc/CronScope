@@ -16,7 +16,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node tests/core.test.js",
+    "test": "node --test tests/*.test.js",
     "build": "node scripts/build.js"
   },
   "keywords": [

@@ -508,14 +508,21 @@ function estimateFireCount(parsed, year) {
 
 const FIRE_COUNT_CAP = 500000;
 const FIRE_TIME_CACHE = new Map();
+const FIRE_DATA_CACHE = new Map();
+
+function parsedCacheBaseKey(parsed, year) {
+  return [parsed.raw, parsed.dialect, parsed.timezone, parsed.dstAware ? "dst" : "wall", year].join("|");
+}
 
 function parsedCacheKey(parsed, year, maxResults) {
-  return [parsed.raw, parsed.dialect, parsed.timezone, parsed.dstAware ? "dst" : "wall", year, maxResults].join("|");
+  return parsedCacheBaseKey(parsed, year) + "|" + maxResults;
 }
 
 function getFireTimes(parsed, year, maxResults = 5000) {
   const key = parsedCacheKey(parsed, year, maxResults);
   if (FIRE_TIME_CACHE.has(key)) return FIRE_TIME_CACHE.get(key);
+  const cappedKey = parsedCacheKey(parsed, year, 5000);
+  if (maxResults <= 5000 && FIRE_TIME_CACHE.has(cappedKey)) return FIRE_TIME_CACHE.get(cappedKey).slice(0, maxResults);
   const results = [];
   if (parsed.years && !parsed.years.has(year)) {
     FIRE_TIME_CACHE.set(key, results);
@@ -543,6 +550,25 @@ function getFireTimes(parsed, year, maxResults = 5000) {
   }
   FIRE_TIME_CACHE.set(key, results);
   return results;
+}
+
+// All visualizations share this immutable per-expression snapshot. Editing one
+// schedule invalidates only its key; unchanged schedules stay hot in cache.
+function getScheduleData(parsed, year, maxResults = 5000) {
+  const normalizedMax = maxResults === undefined ? 5000 : maxResults;
+  const key = parsedCacheKey(parsed, year, normalizedMax);
+  if (FIRE_DATA_CACHE.has(key)) return FIRE_DATA_CACHE.get(key);
+  const times = getFireTimes(parsed, year, normalizedMax);
+  const dayCounts = getDayCounts(times);
+  const hourCounts = new Array(24).fill(0);
+  const dowCounts = new Array(7).fill(0);
+  for (const time of times) {
+    hourCounts[time.getHours()]++;
+    dowCounts[time.getDay()]++;
+  }
+  const data = { times, dayCounts, hourCounts, dowCounts };
+  FIRE_DATA_CACHE.set(key, data);
+  return data;
 }
 
 function getCronDisplayParts(expr, options) {
@@ -701,18 +727,38 @@ function formatRunTime(t) {
   return base + sec + (t.__cronDisplay && t.__cronDisplay.duplicated ? " DST+" : "");
 }
 
-function HeatCell({count,maxCount,color,isToday,tooltip,onClick,accentColor,size=13,label}) {
+function HeatCell({count,maxCount,color,isToday,tooltip,onClick,accentColor,size=13,label,row,col}) {
   const intensity = count===0?0:Math.max(0.15,Math.min(1,count/Math.max(maxCount,1)));
   const bg = count===0?"transparent":color+Math.round(intensity*200).toString(16).padStart(2,"0");
   const border = isToday?"1px solid "+(accentColor||"#06b6d4"):count>0?"1px solid "+color+"22":"1px solid transparent";
   const ref = useRef(null);
+  const moveFocus = event => {
+    const directions = {ArrowLeft:[0,-1],ArrowRight:[0,1],ArrowUp:[-1,0],ArrowDown:[1,0]};
+    const direction = directions[event.key];
+    if (!direction || row === undefined || col === undefined) return;
+    const container = event.currentTarget.closest("[data-heat-container]");
+    if (!container) return;
+    const cells = Array.from(container.querySelectorAll("[data-heat-cell]"));
+    const targetRow = row + direction[0];
+    const targetCol = col + direction[1];
+    const candidates = cells.filter(cell => Number(cell.dataset.heatRow) === targetRow);
+    if (candidates.length === 0) return;
+    const target = direction[0] === 0
+      ? candidates.find(cell => Number(cell.dataset.heatCol) === targetCol)
+      : candidates.slice().sort((a,b) => Math.abs(Number(a.dataset.heatCol)-targetCol) - Math.abs(Number(b.dataset.heatCol)-targetCol))[0];
+    if (!target) return;
+    event.preventDefault();
+    target.focus();
+  };
   return React.createElement("div",{
     ref, onClick, title:tooltip, role:"gridcell", "aria-label":tooltip,
+    "aria-disabled":count===0?"true":undefined,
+    "data-heat-cell":"true", "data-heat-row":row, "data-heat-col":col,
     style:{width:size,height:size,backgroundColor:bg,border,borderRadius:2,cursor:count>0?"pointer":"default",transition:"all 0.15s",position:"relative",display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,color:count>0?"#fff":"inherit",fontFamily:"'JetBrains Mono',monospace"},
     onMouseEnter:()=>{if(count>0&&ref.current){ref.current.style.transform="scale(1.4)";ref.current.style.zIndex="10";}},
     onMouseLeave:()=>{if(ref.current){ref.current.style.transform="scale(1)";ref.current.style.zIndex="1";}},
     tabIndex:count>0?0:-1,
-    onKeyDown:ev=>{if(count>0&&(ev.key==="Enter"||ev.key===" ")){ev.preventDefault();onClick&&onClick();}},
+    onKeyDown:ev=>{moveFocus(ev);if(count>0&&(ev.key==="Enter"||ev.key===" ")){ev.preventDefault();onClick&&onClick();}},
   }, label || null);
 }
 
@@ -720,7 +766,7 @@ function CalendarHeatmap({expressions,year,onDayClick,C}) {
   const today = new Date();
   const isCurrentYear = today.getFullYear()===year;
   const allData = useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>({
-    counts:getDayCounts(getFireTimes(e.parsed,year)),color:EC[i%EC.length],
+    counts:getScheduleData(e.parsed,year).dayCounts,color:EC[i%EC.length],
   })),[expressions,year]);
   const mergedMax = useMemo(()=>{let m=0;for(const d of allData)for(const v of Object.values(d.counts))if(v>m)m=v;return m;},[allData]);
 
@@ -731,7 +777,7 @@ function CalendarHeatmap({expressions,year,onDayClick,C}) {
       const weeks=[];let week=new Array(firstDow).fill(null);
       for(let d=1;d<=dim;d++){week.push(d);if(week.length===7){weeks.push(week);week=[];}}
       if(week.length>0){while(week.length<7)week.push(null);weeks.push(week);}
-      return React.createElement("div",{key:mIdx,style:{display:"flex",alignItems:"flex-start",gap:8},role:"row"},
+      return React.createElement("div",{key:mIdx,style:{display:"flex",alignItems:"flex-start",gap:8},role:"row","data-heat-container":"year-month-"+mIdx},
         React.createElement("div",{style:{width:32,fontSize:11,color:C.textDim,fontFamily:"'JetBrains Mono',monospace",paddingTop:2,textAlign:"right",flexShrink:0}},mName),
         React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:1}},
           weeks.map((w,wi)=>React.createElement("div",{key:wi,style:{display:"flex",gap:1}},
@@ -742,7 +788,7 @@ function CalendarHeatmap({expressions,year,onDayClick,C}) {
               const totalCount=allData.reduce((s,d)=>s+(d.counts[key]||0),0);
               const domIdx=allData.reduce((best,d,i)=>{const c=d.counts[key]||0;return c>(best.count||0)?{idx:i,count:c}:best;},{idx:0,count:0}).idx;
               const color=allData.length>0?allData[domIdx].color:C.accent;
-              return React.createElement(HeatCell,{key:di,count:totalCount,maxCount:mergedMax,color,isToday:isTodayCell,accentColor:C.accent,
+              return React.createElement(HeatCell,{key:di,count:totalCount,maxCount:mergedMax,color,isToday:isTodayCell,accentColor:C.accent,row:wi,col:di,
                 tooltip:mName+" "+day+": "+totalCount+" execution"+(totalCount!==1?"s":""),
                 onClick:()=>totalCount>0&&onDayClick&&onDayClick(year,mIdx,day)});
             })
@@ -755,7 +801,7 @@ function CalendarHeatmap({expressions,year,onDayClick,C}) {
 
 function buildDayAggregation(expressions, year) {
   const allData = expressions.filter(e=>e.parsed).map((e,i)=>({
-    counts:getDayCounts(getFireTimes(e.parsed,year)), color:EC[i%EC.length], label:e.label || e.value
+    counts:getScheduleData(e.parsed,year).dayCounts, color:EC[i%EC.length], label:e.label || e.value
   }));
   let max = 0;
   for (const data of allData) for (const v of Object.values(data.counts)) if (v > max) max = v;
@@ -782,7 +828,7 @@ function MonthZoom({expressions,year,month,onDayClick,C}) {
   for (let i = 0; i < firstDow; i++) cells.push(null);
   for (let d = 1; d <= dim; d++) cells.push(d);
   while (cells.length % 7 !== 0) cells.push(null);
-  return React.createElement("div",{role:"grid","aria-label":MONTHS_FULL[month]+" "+year+" execution heatmap"},
+  return React.createElement("div",{role:"grid","aria-label":MONTHS_FULL[month]+" "+year+" execution heatmap","data-heat-container":"month"},
     React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(7, minmax(0, 1fr))",gap:4,marginBottom:6}},
       DAYS.map(d=>React.createElement("div",{key:d,style:{fontSize:10,color:C.textMuted,textAlign:"center",fontFamily:"'JetBrains Mono',monospace"}},d))
     ),
@@ -791,7 +837,7 @@ function MonthZoom({expressions,year,month,onDayClick,C}) {
         if(day===null) return React.createElement("div",{key:i,style:{aspectRatio:"1 / 1"}});
         const data = aggregateDay(aggregation, month, day, C.accent);
         return React.createElement("div",{key:i,style:{display:"flex",flexDirection:"column",alignItems:"center",gap:3}},
-          React.createElement(HeatCell,{count:data.total,maxCount:aggregation.max,color:data.color,isToday:false,accentColor:C.accent,size:28,label:String(day),
+          React.createElement(HeatCell,{count:data.total,maxCount:aggregation.max,color:data.color,isToday:false,accentColor:C.accent,size:28,label:String(day),row:Math.floor(i/7),col:i%7,
             tooltip:MONTHS[month]+" "+day+": "+data.total+" execution"+(data.total!==1?"s":""),
             onClick:()=>data.total>0&&onDayClick&&onDayClick(year,month,day)}),
           React.createElement("span",{style:{fontSize:9,color:C.textMuted}},data.total>0?data.total:"")
@@ -807,13 +853,13 @@ function WeekZoom({expressions,year,month,day,onDayClick,C}) {
   const start = new Date(selected);
   start.setDate(selected.getDate() - selected.getDay());
   const days = Array.from({length:7},(_,i)=>new Date(start.getFullYear(), start.getMonth(), start.getDate()+i));
-  return React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(7, minmax(0, 1fr))",gap:8},role:"grid","aria-label":"Week execution heatmap"},
+  return React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(7, minmax(0, 1fr))",gap:8},role:"grid","aria-label":"Week execution heatmap","data-heat-container":"week"},
     days.map(d=>{
       const inYear = d.getFullYear() === year;
       const data = inYear ? aggregateDay(aggregation, d.getMonth(), d.getDate(), C.accent) : { total:0, color:C.border };
       return React.createElement("div",{key:d.toISOString(),style:{background:C.surfaceAlt,border:"1px solid "+C.border,borderRadius:8,padding:8,minHeight:86}},
         React.createElement("div",{style:{fontSize:10,color:C.textMuted,fontFamily:"'JetBrains Mono',monospace",marginBottom:6}},DAYS[d.getDay()]+" "+MONTHS[d.getMonth()]+" "+d.getDate()),
-        React.createElement(HeatCell,{count:data.total,maxCount:aggregation.max,color:data.color,isToday:false,accentColor:C.accent,size:34,label:data.total?String(data.total):"",
+        React.createElement(HeatCell,{count:data.total,maxCount:aggregation.max,color:data.color,isToday:false,accentColor:C.accent,size:34,label:data.total?String(data.total):"",row:0,col:i,
           tooltip:MONTHS[d.getMonth()]+" "+d.getDate()+": "+data.total+" execution"+(data.total!==1?"s":""),
           onClick:()=>inYear&&data.total>0&&onDayClick&&onDayClick(year,d.getMonth(),d.getDate())})
       );
@@ -835,7 +881,7 @@ function DayDetail({year,month,day,expressions,onClose,C}) {
   const date=new Date(year,month,day);
   const dayName=DAYS[date.getDay()];
   const details=expressions.filter(e=>e.parsed).map((e,i)=>{
-    const times=getFireTimes(e.parsed,year).filter(t=>t.getMonth()===month&&t.getDate()===day);
+    const times=getScheduleData(e.parsed,year).times.filter(t=>t.getMonth()===month&&t.getDate()===day);
     return {expr:e,color:EC[i%EC.length],times,index:i};
   }).filter(d=>d.times.length>0);
 
@@ -863,12 +909,12 @@ function StatsPanel({expressions,year,C}) {
   const stats=useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
     const estimated = estimateFireCount(e.parsed, year);
     const capped = estimated > FIRE_COUNT_CAP;
-    const times=getFireTimes(e.parsed,year,capped?5000:undefined);
-    const dayCounts=getDayCounts(times);
+    const data=getScheduleData(e.parsed,year,capped?5000:Math.max(5000,estimated+1));
+    const times=data.times;
+    const dayCounts=data.dayCounts;
     const activeDays=Object.keys(dayCounts).length;
     const maxPerDay=Math.max(0,...Object.values(dayCounts));
-    const hourDist=new Array(24).fill(0);const dowDist=new Array(7).fill(0);
-    for(const t of times){hourDist[t.getHours()]++;dowDist[t.getDay()]++;}
+    const hourDist=data.hourCounts;const dowDist=data.dowCounts;
     return {label:e.label||e.value,color:EC[i%EC.length],total:capped?estimated:times.length,activeDays,maxPerDay,
       peakHour:hourDist.indexOf(Math.max(...hourDist)),peakDow:dowDist.indexOf(Math.max(...dowDist)),
       avgPerDay:activeDays>0?((capped?estimated:times.length)/activeDays).toFixed(1):"0",capped,estimated};
@@ -901,8 +947,7 @@ function StatsPanel({expressions,year,C}) {
 
 function HourlyDist({expressions,year,C}) {
   const data=useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
-    const times=getFireTimes(e.parsed,year,5000);const hours=new Array(24).fill(0);
-    for(const t of times) hours[t.getHours()]++;
+    const hours=getScheduleData(e.parsed,year,5000).hourCounts;
     return {hours,color:EC[i%EC.length]};
   }),[expressions,year]);
   const maxVal=Math.max(1,...data.flatMap(d=>d.hours));
@@ -930,9 +975,7 @@ function HourlyDist({expressions,year,C}) {
 
 function PolarClock({expressions,year,C}) {
   const data = useMemo(()=>expressions.filter(e=>e.parsed).map((e,i)=>{
-    const times = getFireTimes(e.parsed, year, 5000);
-    const hours = new Array(24).fill(0);
-    for (const t of times) hours[t.getHours()]++;
+    const hours = getScheduleData(e.parsed,year,5000).hourCounts;
     return { hours, color:EC[i%EC.length], label:e.label || e.value };
   }),[expressions,year]);
   if (data.length === 0) return null;
@@ -979,8 +1022,8 @@ function ConflictDetector({expressions,year,C}) {
     const hits=[];
     for(let i=0;i<valid.length;i++){
       for(let j=i+1;j<valid.length;j++){
-        const setA=new Set(getFireTimes(valid[i].parsed,year,2000).map(t=>t.getTime()));
-        const timesB=getFireTimes(valid[j].parsed,year,2000);
+        const setA=new Set(getScheduleData(valid[i].parsed,year,2000).times.map(t=>t.getTime()));
+        const timesB=getScheduleData(valid[j].parsed,year,2000).times;
         let overlap=0;for(const t of timesB) if(setA.has(t.getTime())) overlap++;
         if(overlap>0) hits.push({a:valid[i].label||valid[i].value,b:valid[j].label||valid[j].value,colorA:EC[i%EC.length],colorB:EC[j%EC.length],overlap});
       }
@@ -1009,8 +1052,8 @@ function ConflictDetector({expressions,year,C}) {
 function DiffView({exprA, exprB, idxA, idxB, year, C}) {
   const data = useMemo(() => {
     if (!exprA.parsed || !exprB.parsed) return null;
-    const timesA = getFireTimes(exprA.parsed, year, 5000);
-    const timesB = getFireTimes(exprB.parsed, year, 5000);
+    const timesA = getScheduleData(exprA.parsed, year, 5000).times;
+    const timesB = getScheduleData(exprB.parsed, year, 5000).times;
     const countsA = getDayCounts(timesA);
     const countsB = getDayCounts(timesB);
     const allKeys = new Set([...Object.keys(countsA), ...Object.keys(countsB)]);
@@ -1066,7 +1109,7 @@ function DiffView({exprA, exprB, idxA, idxB, year, C}) {
 // Gantt-style 24h timeline strip for a selected day
 function GanttStrip({year,month,day,expressions,C}) {
   const strips = useMemo(() => expressions.filter(e=>e.parsed).map((e,i) => {
-    const times = getFireTimes(e.parsed, year, 5000).filter(t => t.getMonth() === month && t.getDate() === day);
+    const times = getScheduleData(e.parsed, year, 5000).times.filter(t => t.getMonth() === month && t.getDate() === day);
     const minutes = times.map(t => ({ value:t.getHours() * 60 + t.getMinutes() + (t.getSeconds ? t.getSeconds() : 0) / 60, label:formatRunTime(t) }));
     return { label: e.label || e.value, color: EC[i % EC.length], minutes, count: times.length };
   }).filter(s => s.count > 0), [expressions, year, month, day]);
@@ -1151,6 +1194,61 @@ function saveTheme(t) {
   try { localStorage.setItem("cronscope_theme", t); } catch {}
 }
 
+// Keep keyboard users inside an open dialog and return focus to the opener.
+function useModalFocus(open, onClose) {
+  const dialogRef = useRef(null);
+  const closeRef = useRef(onClose);
+  closeRef.current = onClose;
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const dialog = dialogRef.current;
+    const previous = document.activeElement;
+    const getFocusable = () => dialog ? Array.from(dialog.querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+    )).filter(element => !element.disabled && element.getAttribute("aria-hidden") !== "true") : [];
+    const focusFirst = () => {
+      const focusable = getFocusable();
+      (focusable[0] || dialog)?.focus();
+    };
+    const focusFrame = typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame(focusFirst)
+      : setTimeout(focusFirst, 0);
+    const onKeyDown = event => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = getFocusable();
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog?.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog?.addEventListener("keydown", onKeyDown);
+    return () => {
+      if (typeof cancelAnimationFrame === "function") cancelAnimationFrame(focusFrame);
+      else clearTimeout(focusFrame);
+      dialog?.removeEventListener("keydown", onKeyDown);
+      if (previous && typeof previous.focus === "function") previous.focus();
+    };
+  }, [open]);
+
+  return dialogRef;
+}
+
 // --- Crontab import parser ---
 function parseCrontabLines(text) {
   return text.split("\n")
@@ -1176,14 +1274,39 @@ function parseCrontabLines(text) {
     .filter(Boolean);
 }
 
+function parseYamlScalar(value) {
+  const text = value.trim();
+  if (!text) return "";
+  const quote = text[0];
+  if (quote === '"' || quote === "'") {
+    const end = text.lastIndexOf(quote);
+    if (end > 0) {
+      const inner = text.slice(1, end);
+      return quote === '"' ? inner.replace(/\\(["\\nrt])/g, (_, code) => ({'"':'"','\\':'\\','n':'\n','r':'\r','t':'\t'}[code])) : inner.replace(/''/g, "'");
+    }
+  }
+  return text.replace(/\s+#.*$/, "").trim();
+}
+
 function parseKubernetesCronJobs(text) {
   const found = [];
   const docs = text.split(/^---\s*$/m);
   docs.forEach((doc, idx) => {
-    const schedule = doc.match(/^\s*schedule:\s*["']?([^"'\n#]+)["']?/m);
+    const lines = doc.split(/\r?\n/);
+    const scheduleLine = lines.find(line => /^\s*schedule\s*:/.test(line));
+    if (!scheduleLine) return;
+    const schedule = parseYamlScalar(scheduleLine.replace(/^\s*schedule\s*:/, ""));
     if (!schedule) return;
-    const name = doc.match(/^\s*name:\s*["']?([^"'\n#]+)["']?/m);
-    found.push({ value:schedule[1].trim(), label:name ? name[1].trim() : "CronJob "+(idx+1) });
+    const metadataIndex = lines.findIndex(line => /^\s*metadata\s*:\s*(?:#.*)?$/.test(line));
+    const metadataIndent = metadataIndex >= 0 ? (lines[metadataIndex].match(/^\s*/)[0].length) : -1;
+    const nameLine = metadataIndex >= 0
+      ? lines.slice(metadataIndex + 1).find(line => {
+        const indent = line.match(/^\s*/)[0].length;
+        return indent > metadataIndent && /^\s*name\s*:/.test(line);
+      })
+      : lines.find(line => /^\s*name\s*:/.test(line));
+    const name = nameLine ? parseYamlScalar(nameLine.replace(/^\s*name\s*:/, "")) : "";
+    found.push({ value:schedule, label:name || "CronJob "+(idx+1) });
   });
   return found;
 }
@@ -1258,18 +1381,34 @@ function generateMarkdownReport(expressions, year, options) {
   return lines.join("\n");
 }
 
+function escapeXml(value) {
+  return String(value).replace(/[&<>"']/g, character => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&apos;"}[character]));
+}
+
 function buildHeatmapSvg(expressions, year, mode, month, day, C) {
   const aggregation = buildDayAggregation(expressions, year);
   const cell = mode === "year" ? 10 : 20;
   const gap = 2;
   const left = 50;
   const top = 34;
-  const width = mode === "year" ? 760 : 520;
-  const height = mode === "year" ? 360 : 260;
+  const width = mode === "year" ? 760 : 560;
+  const height = mode === "year" ? 400 : 320;
   const parts = [];
   parts.push('<svg xmlns="http://www.w3.org/2000/svg" width="'+width+'" height="'+height+'" viewBox="0 0 '+width+' '+height+'">');
   parts.push('<rect width="100%" height="100%" fill="'+C.bg+'"/>');
   parts.push('<text x="20" y="22" fill="'+C.text+'" font-family="Inter, Arial" font-size="16" font-weight="700">CronScope '+year+' '+mode+' export</text>');
+  const validExpressions = expressions.filter(e => e.parsed);
+  const legendX = mode === "year" ? 540 : 310;
+  parts.push('<text x="'+legendX+'" y="42" fill="'+C.textDim+'" font-family="Inter, Arial" font-size="11" font-weight="700">Legend</text>');
+  validExpressions.slice(0, 8).forEach((expression, index) => {
+    const color = EC[expressions.indexOf(expression) % EC.length];
+    const legendY = 56 + index * 16;
+    parts.push('<rect x="'+legendX+'" y="'+(legendY-9)+'" width="9" height="9" rx="2" fill="'+color+'"/>');
+    parts.push('<text x="'+(legendX+15)+'" y="'+legendY+'" fill="'+C.text+'" font-family="Inter, Arial" font-size="9">'+escapeXml(expression.label || expression.value)+'</text>');
+  });
+  if (validExpressions.length > 8) {
+    parts.push('<text x="'+legendX+'" y="'+(56 + 8 * 16)+'" fill="'+C.textMuted+'" font-family="Inter, Arial" font-size="9">+'+(validExpressions.length-8)+' more</text>');
+  }
   const drawCell = (x,y,count,color,label) => {
     const opacity = count===0?0:Math.max(0.15,Math.min(1,count/Math.max(aggregation.max,1)));
     const fill = count===0 ? "transparent" : color + Math.round(opacity*220).toString(16).padStart(2,"0");
@@ -1337,6 +1476,10 @@ function exportPng(expressions, year, mode, month, day, C, done) {
       URL.revokeObjectURL(url);
       done && done();
     }, "image/png", 0.95);
+  };
+  img.onerror = () => {
+    URL.revokeObjectURL(url);
+    done && done(new Error("Unable to render SVG export"));
   };
   img.src = url;
 }
@@ -1425,6 +1568,9 @@ function App() {
   const nextId = useRef(initialExprs.length + 1);
   const C = THEMES[theme];
   const parseOptions = useMemo(()=>({ dialect, fieldMode, timezone, dstAware }),[dialect,fieldMode,timezone,dstAware]);
+  const presetsDialogRef = useModalFocus(showPresets, () => { setShowPresets(false); setActivePresetTarget(null); });
+  const importDialogRef = useModalFocus(showImport, () => { setShowImport(false); setImportText(""); });
+  const setsDialogRef = useModalFocus(showSets, () => setShowSets(false));
 
   // Apply theme class to body
   useEffect(() => {
@@ -1444,6 +1590,7 @@ function App() {
 
   useEffect(() => {
     FIRE_TIME_CACHE.clear();
+    FIRE_DATA_CACHE.clear();
     setExpressions(prev=>prev.map(e=>({...e,parsed:parseCron(e.value,parseOptions)})));
   }, [parseOptions]);
 
@@ -1543,8 +1690,8 @@ function App() {
   }, [expressions, year, zoomMode, selectedMonth, selectedDay, C]);
 
   const handleExportPng = useCallback(() => {
-    exportPng(expressions, year, zoomMode, selectedMonth, selectedDay, C, () => {
-      setCopyFeedback({ type:"png", msg:"PNG exported!" });
+    exportPng(expressions, year, zoomMode, selectedMonth, selectedDay, C, error => {
+      setCopyFeedback({ type:error?"png-error":"png", msg:error?"PNG export failed":"PNG exported!" });
       setTimeout(() => setCopyFeedback(null), 2000);
     });
   }, [expressions, year, zoomMode, selectedMonth, selectedDay, C]);
@@ -1686,9 +1833,9 @@ function App() {
 
       // Presets modal
       showPresets?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
-        onClick:()=>{setShowPresets(false);setActivePresetTarget(null);},role:"dialog","aria-label":"Presets"},
-        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:380,maxHeight:"80vh",overflowY:"auto",animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
-          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:14}},"Presets"),
+        onClick:()=>{setShowPresets(false);setActivePresetTarget(null);},role:"presentation"},
+        React.createElement("div",{ref:presetsDialogRef,role:"dialog","aria-modal":"true","aria-labelledby":"presets-title",tabIndex:-1,style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:380,maxHeight:"80vh",overflowY:"auto",animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
+          React.createElement("div",{id:"presets-title",style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:14}},"Presets"),
           React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:4}},
             PRESETS.map((p,i)=>React.createElement("button",{key:i,onClick:()=>applyPreset(p),
               style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 12px",background:"transparent",border:"1px solid transparent",borderRadius:8,cursor:"pointer",color:C.text,fontSize:12,transition:"all 0.1s",textAlign:"left"},
@@ -1703,9 +1850,9 @@ function App() {
 
       // Import crontab modal
       showImport?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
-        onClick:()=>{setShowImport(false);setImportText("");},role:"dialog","aria-label":"Import crontab"},
-        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:520,animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
-          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}},"Import Schedules"),
+        onClick:()=>{setShowImport(false);setImportText("");},role:"presentation"},
+        React.createElement("div",{ref:importDialogRef,role:"dialog","aria-modal":"true","aria-labelledby":"import-title",tabIndex:-1,style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:520,animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
+          React.createElement("div",{id:"import-title",style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:6}},"Import Schedules"),
           React.createElement("div",{style:{fontSize:11,color:C.textDim,marginBottom:12}},"Paste or drop crontab text or Kubernetes CronJob YAML. Lines starting with # are ignored."),
           React.createElement("textarea",{value:importText,onChange:ev=>setImportText(ev.target.value),
             onDragOver:ev=>{ev.preventDefault();ev.currentTarget.style.borderColor=C.accent;},
@@ -1732,9 +1879,9 @@ function App() {
 
       // Schedule sets modal
       showSets?React.createElement("div",{style:{position:"fixed",inset:0,background:C.modalOverlay,display:"flex",alignItems:"center",justifyContent:"center",zIndex:100,animation:"fadeIn 0.15s ease"},
-        onClick:()=>setShowSets(false),role:"dialog","aria-label":"Schedule sets"},
-        React.createElement("div",{style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:440,maxHeight:"80vh",overflowY:"auto",animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
-          React.createElement("div",{style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:14}},"Schedule Sets"),
+        onClick:()=>setShowSets(false),role:"presentation"},
+        React.createElement("div",{ref:setsDialogRef,role:"dialog","aria-modal":"true","aria-labelledby":"sets-title",tabIndex:-1,style:{background:C.surface,border:"1px solid "+C.border,borderRadius:14,padding:20,width:440,maxHeight:"80vh",overflowY:"auto",animation:"slideIn 0.2s ease"},onClick:ev=>ev.stopPropagation()},
+          React.createElement("div",{id:"sets-title",style:{fontSize:14,fontWeight:600,color:C.text,marginBottom:14}},"Schedule Sets"),
           // Save current
           React.createElement("div",{style:{display:"flex",gap:8,marginBottom:16}},
             React.createElement("input",{value:setNameInput,onChange:ev=>setSetNameInput(ev.target.value),placeholder:"Name for current set","aria-label":"Schedule set name",
@@ -1886,8 +2033,8 @@ function App() {
               copyFeedback&&copyFeedback.type==="svg"?"SVG Saved":"Export SVG"
             ),
             React.createElement("button",{onClick:handleExportPng,
-              style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:copyFeedback&&copyFeedback.type==="png"?C.green:C.textDim,fontSize:12,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},
-              copyFeedback&&copyFeedback.type==="png"?"PNG Saved":"Export PNG"
+              style:{background:C.surface,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",color:copyFeedback&&copyFeedback.type==="png"?C.green:copyFeedback&&copyFeedback.type==="png-error"?C.error:C.textDim,fontSize:12,cursor:"pointer",fontFamily:"'JetBrains Mono',monospace"}},
+              copyFeedback&&copyFeedback.type==="png"?"PNG Saved":copyFeedback&&copyFeedback.type==="png-error"?"PNG Failed":"Export PNG"
             )
           )
         )
